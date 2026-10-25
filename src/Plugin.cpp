@@ -87,6 +87,31 @@ dk2ml::Field<float> Entity_scale{"Entity_Common", "m_scale"};
 // ToggleFOW flips the game's global "fog of war disabled" flag (the game's own free-fly FPS camera calls it when it
 // starts and stops), so it is called once before the nested pass and once after.
 dk2ml::Fn<void(void* renderer)> GameRenderer_ToggleFOW{"GameRenderer::ToggleFOW"};
+// The replay's "cinematic mode" button flips m_renderOptions.plans (found in GameGUI::OnEvent for
+// GUI_GAME_REPLAY_TOGGLE_CINEMATIC_MODE). Off hides the drawn paths and waypoints, and BuildRenderLists then skips every
+// render object whose template says hideInCinematicMode (charge and door highlights among them).
+dk2ml::Field<uint8_t> GameRenderer_renderOptions{"GameRenderer", "m_renderOptions"};
+dk2ml::Field<bool> RenderOptions_plans{"GameRenderer::sRenderOptions", "plans"};
+
+// The red doors: an entity that an order will open, kick or destroy gets the game's "red ghost" look. The game does it in
+// Entity_Client::SetRedGhostEffect(entity, on) by rewriting each of the entity's render objects: alpha blending (blend
+// mode 1) and a diffuse colour of (2, 0, 0, 0.5). The plans flag does not undo that, so the helmet pass undoes it for the
+// doors and puts it back afterwards, using the game's own function both ways.
+dk2ml::Fn<void(void* entity, bool on)> Entity_SetRedGhostEffect{"Entity_Client::SetRedGhostEffect"};
+dk2ml::Global<uint8_t> Door_typeList{"Door_Client::typeList"};
+dk2ml::Field<void*> DoorList_head{"LinkedList<Door_Client>", "head"};
+dk2ml::Field<void*> DoorList_next{"LinkedList<Door_Client>", "next"};
+dk2ml::Field<void*> DoorList_owner{"LinkedList<Door_Client>", "owner"};
+dk2ml::Field<uint8_t> Entity_renderObjects{"Entity_Client", "m_renderObjects"}; // List<unsigned int>: render object ids
+dk2ml::Field<void*> ListId_data{"List<unsigned int>", "m_list"};
+dk2ml::Field<int> ListId_count{"List<unsigned int>", "m_elements"};
+dk2ml::Field<uint8_t> GameRenderer_renderObjectsPool{"GameRenderer", "m_renderObjectsPool"}; // List<sRenderObject>
+dk2ml::Field<void*> ListObject_data{"List<sRenderObject>", "m_list"};
+dk2ml::Field<int> ListObject_count{"List<sRenderObject>", "m_elements"};
+dk2ml::TypeSize sRenderObject_size{"sRenderObject"};
+dk2ml::Field<int> sRenderObject_blendMode{"sRenderObject", "blendMode"};
+dk2ml::Field<uint8_t> sRenderObject_data{"sRenderObject", "data"};
+dk2ml::Field<float> sRenderObjectData_diffuseColor{"sRenderObjectData", "diffuseColor"};
 // void GetShadowMapCameraParams(const Camera& view, Camera& out, Matrix& matrix) const: fits the sun's ortho shadow box
 // around `view`'s frustum.
 dk2ml::Fn<void(void* renderer, const void* view, void* out, void* matrix)> GetShadowMapCameraParams{
@@ -133,6 +158,7 @@ struct Settings {
     float offsetUp = 0.0f;       // metres added to the head height (1.58 standing, 1.14 crouched)
     int testPicture = 0;         // debug: 0 helmet view, 1 mirror of the main view, 2 solid color
     bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
+    bool hidePlans = true;       // the replay's "cinematic mode" for the helmet pass only: no paths, waypoints, highlights
     bool logOperators = false;
     bool anyHuman = false;       // debug: every human counts as an operator
     bool panManaged = false;     // the player changed the end-of-mission pan option, so the mod sets it
@@ -174,6 +200,7 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.holdMs = std::clamp(ReadInt(file, L"hold_ms", s.holdMs), 100, 1000);
     s.testPicture = std::clamp(ReadInt(file, L"test_picture", s.testPicture), 0, 2);
     s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
+    s.hidePlans = ReadInt(file, L"hide_plans", s.hidePlans) != 0;
     s.logOperators = ReadInt(file, L"log_operators", s.logOperators) != 0;
     s.anyHuman = ReadInt(file, L"any_human", s.anyHuman) != 0;
     int pan = ReadInt(file, L"disable_end_camera_pan", s.panManaged ? (s.disableEndCameraPan ? 1 : 0) : -1);
@@ -207,6 +234,7 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"hold_ms", g_settings.holdMs);
     write(L"test_picture", g_settings.testPicture);
     write(L"fow_off", g_settings.fowOff);
+    write(L"hide_plans", g_settings.hidePlans);
     write(L"log_operators", g_settings.logOperators);
     write(L"any_human", g_settings.anyHuman);
     write(L"disable_end_camera_pan", g_settings.panManaged ? (g_settings.disableEndCameraPan ? 1 : 0) : -1);
@@ -295,6 +323,13 @@ void BuildOptions()
                         &g_settings.fowOff};
     fow.onChange = SaveSettings;
     add(fow);
+
+    DK2ML_Option plans = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Hide plans and UI in the helmet view",
+                          "Like the replay's cinematic mode, but only for the helmet picture: no drawn operator paths, "
+                          "waypoints or door and charge highlights. The main view is unaffected",
+                          &g_settings.hidePlans};
+    plans.onChange = SaveSettings;
+    add(plans);
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Game"});
 
@@ -1013,13 +1048,66 @@ const void* g_mainCamera = nullptr; // the camera the game passed to the current
 
 // What the helmet pass changes about the game's state, only for the nested pass: it is put back right after it, so the
 // game's own frame, which runs next, is untouched.
+// True when one of the entity's render objects is in the game's red ghost state (see Entity_SetRedGhostEffect above).
+bool HasRedGhost(void* renderer, void* entity)
+{
+    void* ids = static_cast<char*>(entity) + Entity_renderObjects.Offset();
+    int idCount = dk2ml::At<int>(ids, ListId_count.Offset());
+    const uint32_t* idList = dk2ml::At<const uint32_t*>(ids, ListId_data.Offset());
+    void* pool = static_cast<char*>(renderer) + GameRenderer_renderObjectsPool.Offset();
+    int poolCount = dk2ml::At<int>(pool, ListObject_count.Offset());
+    char* objects = dk2ml::At<char*>(pool, ListObject_data.Offset());
+    if (!idList || !objects || idCount <= 0 || idCount > 64) {
+        return false;
+    }
+    for (int i = 0; i < idCount; ++i) {
+        if (idList[i] >= static_cast<uint32_t>(poolCount)) {
+            continue;
+        }
+        char* object = objects + static_cast<size_t>(idList[i]) * sRenderObject_size.Get();
+        const float* c = reinterpret_cast<const float*>(object + sRenderObject_data.Offset() +
+                                                         sRenderObjectData_diffuseColor.Offset());
+        if (dk2ml::At<int>(object, sRenderObject_blendMode.Offset()) == 1 && c[0] == 2.0f && c[1] == 0.0f &&
+            c[2] == 0.0f && c[3] == 0.5f) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct PassOverrides {
     void* renderer = nullptr;
     bool toggledFow = false;
+    bool changedPlans = false;
+    bool plansBefore = false;
+    std::vector<void*> redDoors; // doors that were red and are plain for the helmet pass
 
     void Apply(void* r)
     {
         renderer = r;
+        if (g_settings.hidePlans) {
+            // Only the flag is written, as the replay button does. The button's handler also clears entity state, which
+            // would change the real game, so it is not called.
+            bool& plans = RenderOptions_plans(static_cast<uint8_t*>(r) + GameRenderer_renderOptions.Offset());
+            plansBefore = plans;
+            changedPlans = true;
+            plans = false;
+
+            // The doors an order will open or kick are red; make them plain for this pass.
+            void* list = Door_typeList.Address();
+            if (list) {
+                void* end = dk2ml::At<void*>(list, DoorList_head.Offset());
+                void* node = dk2ml::At<void*>(list, DoorList_next.Offset());
+                for (int guard = 0; node && node != end && node != list && guard < 1024; ++guard) {
+                    void* door = dk2ml::At<void*>(node, DoorList_owner.Offset());
+                    if (door && HasRedGhost(r, door)) {
+                        Entity_SetRedGhostEffect(door, false);
+                        redDoors.push_back(door);
+                    }
+                    node = dk2ml::At<void*>(node, DoorList_next.Offset());
+                }
+            }
+        }
         if (g_settings.fowOff) {
             GameRenderer_ToggleFOW(r); // fog of war off (flag: disabled)
             toggledFow = true;
@@ -1028,6 +1116,12 @@ struct PassOverrides {
 
     void Restore()
     {
+        if (changedPlans) {
+            RenderOptions_plans(static_cast<uint8_t*>(renderer) + GameRenderer_renderOptions.Offset()) = plansBefore;
+        }
+        for (void* door : redDoors) {
+            Entity_SetRedGhostEffect(door, true); // red again for the game's own frame
+        }
         if (toggledFow) {
             GameRenderer_ToggleFOW(renderer); // and back on
         }
@@ -1110,7 +1204,10 @@ int RenderGamePre(DK2ML_Regs* regs, void*)
             g_api->Log("  eye sources: fixed (%.2f %.2f %.2f), head bone %s (%.2f %.2f %.2f), using %s", g_lastFixedEye.x,
                        g_lastFixedEye.y, g_lastFixedEye.z, g_lastBoneOk ? "ok" : "unusable", g_lastBoneEye.x,
                        g_lastBoneEye.y, g_lastBoneEye.z, g_lastBoneOk ? "the bone" : "the fixed height");
-            g_api->Log("  fog of war off in the helmet view: %d", g_settings.fowOff);
+            g_api->Log("  fog of war off in the helmet view: %d, hide plans: %d (game's plans flag was %d, now restored), "
+                       "red doors made plain for this pass: %d",
+                       g_settings.fowOff, g_settings.hidePlans, overrides.plansBefore,
+                       static_cast<int>(overrides.redDoors.size()));
             g_api->Log("  our view: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", mv[0], mv[1],
                        mv[2], mv[3], mv[4], mv[5], mv[6], mv[7], mv[8], mv[9], mv[10], mv[11]);
             if (gv) {
