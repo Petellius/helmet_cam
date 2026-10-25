@@ -78,6 +78,20 @@ dk2ml::TypeSize SkeletonNode_size{"KHM::sSkeletonNode"};
 dk2ml::Field<char> SkeletonNode_name{"KHM::sSkeletonNode", "sNodeName"}; // StaticString<48>: the chars come first
 dk2ml::Field<float> SkeletonNode_matGlobal{"KHM::sSkeletonNode", "matGlobal"}; // Matrix3x4: 3 x Vector4
 
+// The entity's own basis, to turn the head bone (entity-local) into a world position.
+dk2ml::Field<Vec3> Entity_left{"Entity_Common", "m_left"};
+dk2ml::Field<Vec3> Entity_up{"Entity_Common", "m_up"};
+dk2ml::Field<Vec3> Entity_forward{"Entity_Common", "m_forward"};
+dk2ml::Field<float> Entity_scale{"Entity_Common", "m_scale"};
+
+// ToggleFOW flips the game's global "fog of war disabled" flag (the game's own free-fly FPS camera calls it when it
+// starts and stops), so it is called once before the nested pass and once after.
+dk2ml::Fn<void(void* renderer)> GameRenderer_ToggleFOW{"GameRenderer::ToggleFOW"};
+// void GetShadowMapCameraParams(const Camera& view, Camera& out, Matrix& matrix) const: fits the sun's ortho shadow box
+// around `view`'s frustum.
+dk2ml::Fn<void(void* renderer, const void* view, void* out, void* matrix)> GetShadowMapCameraParams{
+    "GameRenderer::GetShadowMapCameraParams"};
+
 // The game's options (loaded from options.xml): `<DisableCameraPan/>` is this flag.
 dk2ml::Global<uint8_t> Options_game{"Options::game"};
 dk2ml::Field<bool> OptionsGame_disableEndGameCameraPan{"Options::sGame", "disableEndGameCameraPan"};
@@ -118,6 +132,7 @@ struct Settings {
     float offsetForward = 0.10f; // metres ahead of the entity, along the gaze
     float offsetUp = 0.0f;       // metres added to the head height (1.58 standing, 1.14 crouched)
     int testPicture = 0;         // debug: 0 helmet view, 1 mirror of the main view, 2 solid color
+    bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
     bool logOperators = false;
     bool anyHuman = false;       // debug: every human counts as an operator
     bool panManaged = false;     // the player changed the end-of-mission pan option, so the mod sets it
@@ -158,6 +173,7 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.key = ReadInt(file, L"key", s.key);
     s.holdMs = std::clamp(ReadInt(file, L"hold_ms", s.holdMs), 100, 1000);
     s.testPicture = std::clamp(ReadInt(file, L"test_picture", s.testPicture), 0, 2);
+    s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
     s.logOperators = ReadInt(file, L"log_operators", s.logOperators) != 0;
     s.anyHuman = ReadInt(file, L"any_human", s.anyHuman) != 0;
     int pan = ReadInt(file, L"disable_end_camera_pan", s.panManaged ? (s.disableEndCameraPan ? 1 : 0) : -1);
@@ -190,6 +206,7 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"key", g_settings.key);
     write(L"hold_ms", g_settings.holdMs);
     write(L"test_picture", g_settings.testPicture);
+    write(L"fow_off", g_settings.fowOff);
     write(L"log_operators", g_settings.logOperators);
     write(L"any_human", g_settings.anyHuman);
     write(L"disable_end_camera_pan", g_settings.panManaged ? (g_settings.disableEndCameraPan ? 1 : 0) : -1);
@@ -271,6 +288,13 @@ void BuildOptions()
            -0.5f, 1.0f, "%.2f m");
     slider("Height offset", "Raises or lowers the camera from the head height (1.58 m standing, 1.14 m crouched)",
            &g_settings.offsetUp, -0.5f, 0.5f, "%.2f m");
+
+    DK2ML_Option fow = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Fog of war off in the helmet view",
+                        "Shows the floor everywhere in the helmet picture. Only the picture changes; the game still hides "
+                        "enemies you haven't seen",
+                        &g_settings.fowOff};
+    fow.onChange = SaveSettings;
+    add(fow);
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Game"});
 
@@ -899,6 +923,37 @@ Vec3 Normalize(Vec3 v)
     return len > 1e-5f ? Vec3{v.x / len, v.y / len, v.z / len} : Vec3{0.0f, 0.0f, -1.0f};
 }
 
+// The head bone's world position. Its matGlobal translation is entity-local (the log showed about (0, 1.58, 0.09)
+// standing), so it goes through the entity's own basis: origin + left*x + up*y + forward*z, scaled. False when the
+// numbers don't look like a head (no skeleton, a degenerate basis, a bone far from the body): the caller then falls back
+// to the fixed height.
+Vec3 g_lastFixedEye = {};
+Vec3 g_lastBoneEye = {};
+bool g_lastBoneOk = false;
+
+bool HeadWorldPosition(void* human, Vec3& out)
+{
+    const float* b = HeadBone(human);
+    if (!b) {
+        return false;
+    }
+    Vec3 local = {b[3], b[7], b[11]};
+    Vec3 l = Entity_left(human), u = Entity_up(human), fw = Entity_forward(human);
+    float scale = Entity_scale(human);
+    bool basisOk = std::fabs(Dot(l, l) - 1.0f) < 0.1f && std::fabs(Dot(u, u) - 1.0f) < 0.1f &&
+                   std::fabs(Dot(fw, fw) - 1.0f) < 0.1f;
+    bool localOk = std::isfinite(local.x) && std::isfinite(local.y) && std::isfinite(local.z) && local.y > 0.3f &&
+                   local.y < 2.5f && std::fabs(local.x) < 1.5f && std::fabs(local.z) < 1.5f;
+    if (!basisOk || !localOk || !(scale > 0.1f && scale < 10.0f)) {
+        return false;
+    }
+    Vec3 o = Entity_origin(human);
+    out = {o.x + (l.x * local.x + u.x * local.y + fw.x * local.z) * scale,
+           o.y + (l.y * local.x + u.y * local.y + fw.y * local.z) * scale,
+           o.z + (l.z * local.x + u.z * local.y + fw.z * local.z) * scale};
+    return true;
+}
+
 // A look-at view matrix for the game's world: Y is up and the ground is X/Z (every human's origin is (x, 0, z)).
 // Stored the way the game stores its own, which the log showed for the top-down camera: row-major, rows right / up /
 // -forward, translation in the fourth column = -(row . position).
@@ -913,10 +968,23 @@ void BuildCamera(void* human, const int* viewport, Vec3& eyeOut, Vec3& fwdOut)
     look.y = 0.0f; // level gaze for now; pitch comes later
     Vec3 f = Normalize(look);
 
-    // The origin is on the floor. The head bone sits 1.58 above it standing and 1.14 crouched (from the logged bones);
-    // the player's offsets move the camera from there (by default a little ahead, so it isn't inside the head).
-    Vec3 eye = Entity_origin(human);
-    eye.y += (Human_isCrouched(human) ? 1.14f : 1.58f) + g_settings.offsetUp;
+    // The origin is on the floor. The fixed fallback uses the head heights seen in the logged bones: 1.58 standing, 1.14
+    // crouched. With "Eye follows the animated head" the live head bone replaces it, so the camera moves with the
+    // animation. The player's offsets are added on top (by default a little ahead, so it isn't inside the head).
+    Vec3 fixedEye = Entity_origin(human);
+    fixedEye.y += Human_isCrouched(human) ? 1.14f : 1.58f;
+
+    Vec3 eye = fixedEye;
+    Vec3 boneEye = {};
+    bool haveBone = HeadWorldPosition(human, boneEye);
+    if (haveBone) { // the live head bone; the fixed height only when the bone data is unusable
+        eye = boneEye;
+    }
+    g_lastFixedEye = fixedEye;
+    g_lastBoneEye = boneEye;
+    g_lastBoneOk = haveBone;
+
+    eye.y += g_settings.offsetUp;
     eye.x += f.x * g_settings.offsetForward;
     eye.z += f.z * g_settings.offsetForward;
 
@@ -941,6 +1009,41 @@ void BuildCamera(void* human, const int* viewport, Vec3& eyeOut, Vec3& fwdOut)
 
 // --- the hook ---
 thread_local bool t_inHelmetPass = false;
+const void* g_mainCamera = nullptr; // the camera the game passed to the current RenderGame (GameClient::m_camera)
+
+// What the helmet pass changes about the game's state, only for the nested pass: it is put back right after it, so the
+// game's own frame, which runs next, is untouched.
+struct PassOverrides {
+    void* renderer = nullptr;
+    bool toggledFow = false;
+
+    void Apply(void* r)
+    {
+        renderer = r;
+        if (g_settings.fowOff) {
+            GameRenderer_ToggleFOW(r); // fog of war off (flag: disabled)
+            toggledFow = true;
+        }
+    }
+
+    void Restore()
+    {
+        if (toggledFow) {
+            GameRenderer_ToggleFOW(renderer); // and back on
+        }
+    }
+};
+
+// The sun's shadow box is fitted to the camera passed in, which suits the top-down view but not a head-height one
+// (outdoor characters came out unlit). While the helmet pass runs, hand it the game's main camera instead, so the sun
+// lights the scene as it does in the normal view (R6: only inside our pass).
+int ShadowParamsPre(DK2ML_Regs* regs, void*)
+{
+    if (t_inHelmetPass && g_mainCamera) {
+        dk2ml::SetArg<const void*>(regs, 1, g_mainCamera);
+    }
+    return DK2ML_CALL_ORIGINAL;
+}
 
 struct FrameInfo {
     bool active = false; // a corner picture is due after this RenderGame
@@ -986,9 +1089,13 @@ int RenderGamePre(DK2ML_Regs* regs, void*)
         Vec3 eye, fwd;
         BuildCamera(target, viewport, eye, fwd);
 
+        g_mainCamera = mainCamera;
+        PassOverrides overrides;
+        overrides.Apply(renderer);
         t_inHelmetPass = true;
         RenderGame(renderer, viewport, g_camera);
         t_inHelmetPass = false;
+        overrides.Restore();
         GlStage("in the nested RenderGame");
 
         CaptureBackBuffer(viewport[2], viewport[3]);
@@ -1000,6 +1107,10 @@ int RenderGamePre(DK2ML_Regs* regs, void*)
             const float* gv = mainCamera ? &Camera_m_matView(mainCamera) : nullptr;
             g_api->Log("helmet pass %d: operator %u eye (%.2f %.2f %.2f) facing (%.2f %.2f %.2f)", g_helmetFrames,
                        Entity_id(target), eye.x, eye.y, eye.z, fwd.x, fwd.y, fwd.z);
+            g_api->Log("  eye sources: fixed (%.2f %.2f %.2f), head bone %s (%.2f %.2f %.2f), using %s", g_lastFixedEye.x,
+                       g_lastFixedEye.y, g_lastFixedEye.z, g_lastBoneOk ? "ok" : "unusable", g_lastBoneEye.x,
+                       g_lastBoneEye.y, g_lastBoneEye.z, g_lastBoneOk ? "the bone" : "the fixed height");
+            g_api->Log("  fog of war off in the helmet view: %d", g_settings.fowOff);
             g_api->Log("  our view: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", mv[0], mv[1],
                        mv[2], mv[3], mv[4], mv[5], mv[6], mv[7], mv[8], mv[9], mv[10], mv[11]);
             if (gv) {
@@ -1186,6 +1297,9 @@ DK2ML_EXPORT int DK2ML_PluginInit(const DK2ML_API* api, const DK2ML_PluginInfo* 
     }
     if (!dk2ml::Hook(api, RenderGame, RenderGamePre, RenderGamePost)) {
         return 4;
+    }
+    if (!dk2ml::Hook(api, GetShadowMapCameraParams, ShadowParamsPre)) {
+        return 6;
     }
 
     api->Log("ready (spike): hold vk=0x%X for %d ms to open or close the cam, tap to cycle", g_settings.key,
