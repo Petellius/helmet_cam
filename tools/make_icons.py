@@ -134,6 +134,9 @@ def write_dds(path, img):
     header += b'\0' * 44  # 11 reserved dwords
     header += struct.pack('<8I', 32, 0x41, 0, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000)
     header += struct.pack('<5I', 0x1000, 0, 0, 0, 0)
+    # The game reads the rows of uncompressed DDS bottom-first (OpenGL order), so the picture goes in upside down to come
+    # out upright in the HUD.
+    img = img.transpose(Image.FLIP_TOP_BOTTOM)
     r, g, b, a = img.split()
     bgra = Image.merge('RGBA', (b, g, r, a)).tobytes()
     with open(path, 'wb') as f:

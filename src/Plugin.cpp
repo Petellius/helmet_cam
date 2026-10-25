@@ -1934,7 +1934,7 @@ void DrawNameLabel()
 // --- the HUD widget: one Helmet Cam icon in the game's bottom HUD bar; clicking it fans out an arc of buttons ---
 // mod\gui\helmetcam_hud.xml (like Free Camera's wheel). There is one main icon per bar ("HUD" live, "HUD_Replay_Full" in
 // replays; an item has one parent), and one shared arc ("wheel") that moves into the icon in use while the arc is open (a
-// click on the icon opens it, another closes it). The arc holds four controls, each an item pair "_a"/"_b" (the state buttons): selection mode, lock,
+// click on the icon opens it, another click on it or anywhere else closes it). The arc holds four controls, each an item pair "_a"/"_b" (the state buttons): selection mode, lock,
 // action cam, night vision. Items are found after every GUI_LOADED and moved each time the HUD changes.
 dk2ml::Enum EVENT_CLICK{"GUI::Item::eItemEventType", "EVENT_CLICK"};
 
@@ -1949,7 +1949,17 @@ struct HudWidget {
     void* buttonB[kHudControls] = {};
 };
 HudWidget g_hud;
-bool g_arcOpen = false; // the main icon was clicked: the arc of buttons is out until it is clicked again
+bool g_arcOpen = false; // the main icon was clicked: the arc of buttons is out until it is clicked again, or a click lands elsewhere
+
+// Clicks elsewhere close the arc. Our buttons report clicks through callbacks; a mouse press that produced none of ours
+// was somewhere else (the map, another HUD button, the arc's background, a right click). Frames are counted because the
+// callback may fire a frame before or after we poll the mouse.
+int64_t g_frameNo = 0;
+int64_t g_ourClickFrame = -100; // the frame of our last button click
+int64_t g_downFrame = 0;        // the frame the current mouse press began
+bool g_mouseDown = false;
+int g_releaseWait = 0;          // frames left before judging the press that just ended
+constexpr int kDismissDelayFrames = 2;
 
 bool HudState(int control) // true: the second ("_b") button
 {
@@ -1963,11 +1973,29 @@ bool HudState(int control) // true: the second ("_b") button
 
 void OnMenuClick(void*, float, float, void*)
 {
+    g_ourClickFrame = g_frameNo;
     g_arcOpen = !g_arcOpen;
+}
+
+void UpdateArcDismiss()
+{
+    ++g_frameNo;
+    bool down = g_api->IsGameFocused() && ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000) != 0;
+    if (down && !g_mouseDown) {
+        g_downFrame = g_frameNo;
+    }
+    if (!down && g_mouseDown) {
+        g_releaseWait = kDismissDelayFrames + 1;
+    }
+    g_mouseDown = down;
+    if (g_releaseWait > 0 && --g_releaseWait == 0 && g_arcOpen && g_ourClickFrame < g_downFrame - 1) {
+        g_arcOpen = false;
+    }
 }
 
 void OnHudClick(void*, float, float, void* user)
 {
+    g_ourClickFrame = g_frameNo;
     switch (static_cast<int>(reinterpret_cast<intptr_t>(user))) {
     case kHudSelect: g_settings.selectionMode = g_settings.selectionMode == 1 ? 0 : 1; break;
     case kHudLock: ToggleLock(); return;
@@ -2092,6 +2120,7 @@ void OnFrame(const DK2ML_Event*, void*)
     }
     DrawSettingsWindow();
     DrawNameLabel();
+    UpdateArcDismiss();
     UpdateHud();
 }
 
