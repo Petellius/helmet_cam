@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -228,9 +229,13 @@ void OnReset(const DK2ML_Option*, void*)
     g_api->Log("settings reset to the packaged defaults");
 }
 
-void AddOptions()
+// One table of options feeds both UIs: the Modloader page (AddOption, main menu) and the in-mission window below, so
+// they list the same controls in the same order. The loader copies each entry; the window reads this table directly.
+std::vector<DK2ML_Option> g_options;
+
+void BuildOptions()
 {
-    auto add = [](DK2ML_Option o) { g_api->AddOption(&o); };
+    auto add = [](DK2ML_Option o) { g_options.push_back(o); };
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER,
          "Helmet Cam - WARNING: renders the scene a second time while open, expect a lower frame rate"});
@@ -302,6 +307,237 @@ void AddOptions()
                           "Restores the values this mod shipped with"};
     reset.onChange = OnReset;
     add(reset);
+}
+
+bool AddOptions()
+{
+    BuildOptions();
+    for (const DK2ML_Option& o : g_options) {
+        if (g_api->AddOption(&o) != DK2ML_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// --- the in-mission settings window (opened by the Esc-menu "CAM" button) ---
+// ImGui names verified with symtest. Several helpers are inlined away in this build (PopID, PopStyleColor, EndCombo,
+// Separator, PopItemWidth, IsItemHovered, SetNextWindowPos, GetIO), so the window avoids them: unique "##" ids instead
+// of PushID, buttons instead of a combo, hint text instead of tooltips, and ImGui remembers the window position.
+struct ImVec2 {
+    float x, y;
+};
+
+dk2ml::Fn<bool(const char* name, bool* open, int flags)> ImGui_Begin{"ImGui::Begin"};
+dk2ml::Fn<void()> ImGui_End{"ImGui::End"};
+dk2ml::Fn<bool(const char* label, bool* value)> ImGui_Checkbox{"ImGui::Checkbox"};
+dk2ml::Fn<bool(const char* label, int dataType, void* data, const void* min, const void* max, const char* format,
+               int flags)>
+    ImGui_SliderScalar{"ImGui::SliderScalar"};
+dk2ml::Fn<bool(const char* label, const ImVec2* size, int flags)> ImGui_ButtonEx{"ImGui::ButtonEx"};
+dk2ml::Fn<void(const char* text, const char* textEnd, int flags)> ImGui_TextEx{"ImGui::TextEx"};
+dk2ml::Fn<void(const char* fmt, ...)> ImGui_TextWrapped{"ImGui::TextWrapped"};
+dk2ml::Fn<void(float offsetFromStartX, float spacing)> ImGui_SameLine{"ImGui::SameLine"};
+dk2ml::Fn<void()> ImGui_Spacing{"ImGui::Spacing"};
+dk2ml::Fn<void(int flags)> ImGui_SeparatorEx{"ImGui::SeparatorEx"};
+
+dk2ml::Enum ImGuiWindowFlags_AlwaysAutoResize{"ImGuiWindowFlags_", "ImGuiWindowFlags_AlwaysAutoResize"};
+dk2ml::Enum ImGuiWindowFlags_NoCollapse{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoCollapse"};
+dk2ml::Enum ImGuiDataType_Float{"ImGuiDataType_", "ImGuiDataType_Float"};
+dk2ml::Enum ImGuiDataType_S32{"ImGuiDataType_", "ImGuiDataType_S32"};
+
+// ImGui's own IO flags say when ImGui uses the mouse or keyboard (R28). GetIO was inlined away: read the context.
+dk2ml::Global<void*> GImGui{"GImGui"};
+dk2ml::Field<uint8_t> ImGuiContext_IO{"ImGuiContext", "IO"};
+dk2ml::Field<bool> ImGuiIO_WantCaptureMouse{"ImGuiIO", "WantCaptureMouse"};
+dk2ml::Field<bool> ImGuiIO_WantCaptureKeyboard{"ImGuiIO", "WantCaptureKeyboard"};
+
+bool g_windowOpen = false;
+bool g_waitingForKey = false;  // the window's "Rebind" was clicked: the next key press becomes the helmet cam key
+bool g_capturing = false;      // we told the game to ignore the map and HUD (R28)
+bool g_waitingNeedsRelease = false; // the click that started the rebind (mouse) must be released first
+
+std::string KeyName(int vk)
+{
+    switch (vk) {
+    case 0: return "(none)";
+    case VK_LBUTTON: return "Mouse left";
+    case VK_RBUTTON: return "Mouse right";
+    case VK_MBUTTON: return "Mouse middle";
+    case VK_XBUTTON1: return "Mouse 4";
+    case VK_XBUTTON2: return "Mouse 5";
+    case VK_SHIFT: return "Shift";
+    case VK_CONTROL: return "Ctrl";
+    case VK_MENU: return "Alt";
+    case VK_SPACE: return "Space";
+    case VK_TAB: return "Tab";
+    case VK_RETURN: return "Enter";
+    case VK_CAPITAL: return "Caps Lock";
+    default: break;
+    }
+    LONG scan = static_cast<LONG>(MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_VSC)) << 16;
+    char name[64] = {};
+    if (scan && GetKeyNameTextA(scan, name, sizeof(name)) > 0) {
+        return name;
+    }
+    char hex[16];
+    snprintf(hex, sizeof(hex), "VK 0x%X", vk);
+    return hex;
+}
+
+// While rebinding: the first key or mouse button (not left/right click: those clicked the window) that goes down. Esc
+// cancels. Left/right Shift, Ctrl and Alt are stored as the generic VK_SHIFT, VK_CONTROL and VK_MENU, as the loader does.
+void PollRebind()
+{
+    if (g_waitingNeedsRelease) {
+        if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
+            g_waitingNeedsRelease = false;
+        }
+        return;
+    }
+    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+        g_waitingForKey = false;
+        return;
+    }
+    for (int vk = 0x04; vk < 0xFF; ++vk) {
+        if (vk == VK_ESCAPE || vk == VK_LBUTTON || vk == VK_RBUTTON || (vk >= VK_LSHIFT && vk <= VK_RMENU)) {
+            continue; // the generic modifiers VK_SHIFT/VK_CONTROL/VK_MENU stand for the left and right ones
+        }
+        if (GetAsyncKeyState(vk) & 0x8000) {
+            g_settings.key = vk;
+            g_waitingForKey = false;
+            SaveSettings(nullptr, nullptr);
+            g_api->Log("helmet cam key set to %s (vk=0x%X)", KeyName(vk).c_str(), vk);
+            return;
+        }
+    }
+}
+
+// One row per table entry. Each change runs the entry's own onChange, like the Modloader page does.
+void DrawOption(DK2ML_Option& o, int index)
+{
+    char id[96];
+    switch (o.type) {
+    case DK2ML_OPTION_HEADER:
+        ImGui_Spacing();
+        ImGui_SeparatorEx(1); // ImGuiSeparatorFlags_Horizontal
+        ImGui_TextEx(o.label, nullptr, 0);
+        break;
+    case DK2ML_OPTION_BOOL: {
+        snprintf(id, sizeof(id), "%s##opt%d", o.label, index);
+        if (ImGui_Checkbox(id, static_cast<bool*>(o.value)) && o.onChange) {
+            o.onChange(&o, o.user);
+        }
+        ImGui_TextWrapped("%s", o.tooltip ? o.tooltip : "");
+        break;
+    }
+    case DK2ML_OPTION_FLOAT:
+    case DK2ML_OPTION_INT: {
+        snprintf(id, sizeof(id), "%s##opt%d", o.label, index);
+        bool isFloat = o.type == DK2ML_OPTION_FLOAT;
+        float fmin = o.min, fmax = o.max;
+        int imin = static_cast<int>(o.min), imax = static_cast<int>(o.max);
+        bool changed = ImGui_SliderScalar(id, static_cast<int>((isFloat ? ImGuiDataType_Float : ImGuiDataType_S32).Get()),
+                                          o.value, isFloat ? static_cast<const void*>(&fmin) : &imin,
+                                          isFloat ? static_cast<const void*>(&fmax) : &imax, o.format ? o.format : "%.2f",
+                                          0);
+        if (changed && o.onChange) {
+            o.onChange(&o, o.user);
+        }
+        ImGui_TextWrapped("%s", o.tooltip ? o.tooltip : "");
+        break;
+    }
+    case DK2ML_OPTION_CHOICE: {
+        int& value = *static_cast<int*>(o.value);
+        ImGui_TextEx(o.label, nullptr, 0);
+        for (int i = 0; i < o.choiceCount; ++i) {
+            // The chosen entry is marked with brackets: styles can't be pushed and popped from here.
+            snprintf(id, sizeof(id), "%s%s%s##opt%d_%d", i == value ? "[ " : "", o.choices[i], i == value ? " ]" : "",
+                     index, i);
+            ImVec2 size = {0.0f, 0.0f};
+            if (ImGui_ButtonEx(id, &size, 0) && i != value) {
+                value = i;
+                if (o.onChange) {
+                    o.onChange(&o, o.user);
+                }
+            }
+            if (i + 1 < o.choiceCount) {
+                ImGui_SameLine(0.0f, -1.0f);
+            }
+        }
+        ImGui_TextWrapped("%s", o.tooltip ? o.tooltip : "");
+        break;
+    }
+    case DK2ML_OPTION_KEY: {
+        std::string label = g_waitingForKey ? std::string("Press a key, or Esc to cancel...")
+                                            : std::string(o.label) + ": " + KeyName(*static_cast<int*>(o.value));
+        ImGui_TextEx(label.c_str(), nullptr, 0);
+        ImGui_SameLine(0.0f, -1.0f);
+        snprintf(id, sizeof(id), "Rebind##opt%d", index);
+        ImVec2 size = {0.0f, 0.0f};
+        if (ImGui_ButtonEx(id, &size, 0) && !g_waitingForKey) {
+            g_waitingForKey = true;
+            g_waitingNeedsRelease = true; // the click on this button is still down
+        }
+        ImGui_TextWrapped("%s", o.tooltip ? o.tooltip : "");
+        break;
+    }
+    case DK2ML_OPTION_BUTTON: {
+        snprintf(id, sizeof(id), "%s##opt%d", o.label, index);
+        ImVec2 size = {0.0f, 0.0f};
+        if (ImGui_ButtonEx(id, &size, 0) && o.onChange) {
+            o.onChange(&o, o.user);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void UpdateInputCapture(bool windowShown)
+{
+    void* context = GImGui ? *GImGui : nullptr;
+    bool wants = false;
+    if (context) {
+        int io = ImGuiContext_IO.Offset();
+        wants = dk2ml::At<bool>(context, io + ImGuiIO_WantCaptureMouse.Offset()) ||
+                dk2ml::At<bool>(context, io + ImGuiIO_WantCaptureKeyboard.Offset());
+    }
+    bool capture = windowShown && (wants || g_waitingForKey);
+    if (capture != g_capturing && dk2ml::CaptureInput(g_api, capture)) {
+        g_capturing = capture;
+    }
+}
+
+void DrawSettingsWindow()
+{
+    bool shown = false;
+    if (g_windowOpen) {
+        int flags = static_cast<int>(ImGuiWindowFlags_AlwaysAutoResize.Get() | ImGuiWindowFlags_NoCollapse.Get());
+        bool open = true;
+        shown = ImGui_Begin("Helmet Cam##helmetcam_settings", &open, flags);
+        if (shown) {
+            ImGui_TextEx("WARNING: the helmet cam renders the scene a second time while open.", nullptr, 0);
+            for (size_t i = 0; i < g_options.size(); ++i) {
+                if (i == 0 && g_options[i].type == DK2ML_OPTION_HEADER) {
+                    continue; // the warning above says the same as the first header
+                }
+                DrawOption(g_options[i], static_cast<int>(i));
+            }
+        }
+        ImGui_End(); // always, even when the window is collapsed (Begin's result)
+        if (!open) {
+            g_windowOpen = false;
+        }
+    }
+    if (!g_windowOpen) {
+        g_waitingForKey = false;
+    }
+    if (g_waitingForKey) {
+        PollRebind();
+    }
+    UpdateInputCapture(g_windowOpen && shown);
 }
 
 // --- game state helpers (main thread only) ---
@@ -807,7 +1043,7 @@ ULONGLONG g_keyPressedAt = 0;
 
 void HandleKey()
 {
-    bool usable = g_settings.enabled && g_settings.key && InMission() && g_api->IsGameFocused() &&
+    bool usable = g_settings.enabled && g_settings.key && !g_waitingForKey && InMission() && g_api->IsGameFocused() &&
                   !g_api->IsGameMenuOpen();
     bool down = usable && (GetAsyncKeyState(g_settings.key) & 0x8000) != 0;
     bool vkIsModifier = g_settings.key == VK_CONTROL || g_settings.key == VK_MENU;
@@ -888,6 +1124,7 @@ void OnFrame(const DK2ML_Event*, void*)
         LogOperators();
     }
     HandleKey();
+    DrawSettingsWindow();
 }
 
 void OnStateChanged(const DK2ML_Event* e, void*)
@@ -897,7 +1134,13 @@ void OnStateChanged(const DK2ML_Event* e, void*)
             g_api->Log("helmet cam closed: left the mission");
         }
         ResetCam();
+        g_windowOpen = false; // the Esc-menu button only exists in a mission
     }
+}
+
+void OnSettingsButton(void*, float, float, void*)
+{
+    g_windowOpen = !g_windowOpen;
 }
 
 void OnMapLoaded(const DK2ML_Event*, void*)
@@ -921,7 +1164,18 @@ DK2ML_EXPORT int DK2ML_PluginInit(const DK2ML_API* api, const DK2ML_PluginInfo* 
         return 2;
     }
 
-    AddOptions();
+    if (!AddOptions()) {
+        return 5;
+    }
+
+    // The Esc menu's "CAM" button opens the settings window: a label instead of an icon, so there's no art to ship.
+    DK2ML_MenuButton button = {sizeof(button)};
+    button.tooltip = "Helmet Cam settings";
+    button.label = "CAM";
+    button.onClick = OnSettingsButton;
+    if (!dk2ml::gui::AddMenuButton(api, button)) {
+        api->Log("no Esc-menu button (the settings are still on the Modloader page)");
+    }
 
     if (!dk2ml::On(api, DK2ML_EVENT_FRAME, OnFrame) || !dk2ml::On(api, DK2ML_EVENT_STATE_CHANGED, OnStateChanged) ||
         !dk2ml::On(api, DK2ML_EVENT_MAP_LOADED, OnMapLoaded)) {
