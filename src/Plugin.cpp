@@ -111,6 +111,16 @@ dk2ml::Fn<bool(const Vec3* eye, const Vec3* dir, float coneDeg, const void* targ
 dk2ml::Fn<void(void* human, int mask, int event, unsigned size, const void* packer)> Human_Net_ReceiveEvent{
     "?Net_ReceiveEvent@Human_Client@@UEAAXW4eNetworkMask@@W4eEntityEvent@Entity_Common@@IAEBVBitPacker@@@Z"};
 
+// The operator's name for the label. Human_Client::m_humanId (sHumanId) starts with the personal name the HUD shows (its
+// StaticString<48> chars are at offset 0). Without one: the unit name (Entity_Common::m_szName), then the template's unit
+// and class names. A string starting with '@' is a localization key. Loca::GetTextForId(key, logIfMissing, ?) returns the
+// text, or null when the key isn't found (it also returns null for a string without '@').
+dk2ml::Field<char> Human_humanId{"Human_Client", "m_humanId"};
+dk2ml::Field<char> HumanTemplate_unitName{"Human_Template", "unitName"};
+dk2ml::Field<char> HumanTemplate_className{"Human_Template", "className"};
+dk2ml::Fn<const char*(const char* key, bool logIfMissing, bool flag)> Loca_GetTextForId{
+    "?GetTextForId@Loca@@YAPEBDPEBD_N1@Z"};
+
 // ToggleFOW flips the game's global "fog of war disabled" flag (the game's own free-fly FPS camera calls it when it
 // starts and stops), so it is called once before the nested pass and once after.
 dk2ml::Fn<void(void* renderer)> GameRenderer_ToggleFOW{"GameRenderer::ToggleFOW"};
@@ -184,6 +194,7 @@ struct Settings {
     float offsetForward = 0.10f; // metres ahead of the entity, along the gaze
     float offsetUp = 0.0f;       // metres added to the head height (1.58 standing, 1.14 crouched)
     int testPicture = 0;         // debug: 0 helmet view, 1 mirror of the main view, 2 solid color
+    bool showName = true;        // the operator's name at the top left of the helmet picture
     bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
     bool hidePlans = true;       // the replay's "cinematic mode" for the helmet pass only: no paths, waypoints, highlights
     // Automatic switching of the cam's operator.
@@ -234,6 +245,7 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.key = ReadInt(file, L"key", s.key);
     s.holdMs = std::clamp(ReadInt(file, L"hold_ms", s.holdMs), 100, 1000);
     s.testPicture = std::clamp(ReadInt(file, L"test_picture", s.testPicture), 0, 2);
+    s.showName = ReadInt(file, L"show_name", s.showName) != 0;
     s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
     s.hidePlans = ReadInt(file, L"hide_plans", s.hidePlans) != 0;
     s.followSelection = ReadInt(file, L"follow_selection", s.followSelection) != 0;
@@ -275,6 +287,7 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"key", g_settings.key);
     write(L"hold_ms", g_settings.holdMs);
     write(L"test_picture", g_settings.testPicture);
+    write(L"show_name", g_settings.showName);
     write(L"fow_off", g_settings.fowOff);
     write(L"hide_plans", g_settings.hidePlans);
     write(L"cooldown_ms", g_settings.cooldownMs);
@@ -365,6 +378,13 @@ void BuildOptions()
            -0.5f, 1.0f, "%.2f m");
     slider("Height offset", "Raises or lowers the camera from the head height (1.58 m standing, 1.14 m crouched)",
            &g_settings.offsetUp, -0.5f, 0.5f, "%.2f m");
+
+    DK2ML_Option showName = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Show the operator's name",
+                             "Writes the name of the operator the cam is on at the top left of the helmet picture. If they "
+                             "have no name, their unit or class name is shown",
+                             &g_settings.showName};
+    showName.onChange = SaveSettings;
+    add(showName);
 
     DK2ML_Option fow = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Fog of war off in the helmet view",
                         "Shows the floor everywhere in the helmet picture. Only the picture changes; the game still hides "
@@ -485,6 +505,17 @@ dk2ml::Fn<void(int flags)> ImGui_SeparatorEx{"ImGui::SeparatorEx"};
 
 dk2ml::Enum ImGuiWindowFlags_AlwaysAutoResize{"ImGuiWindowFlags_", "ImGuiWindowFlags_AlwaysAutoResize"};
 dk2ml::Enum ImGuiWindowFlags_NoCollapse{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoCollapse"};
+// The name label: a borderless, click-through window placed by pixel position (SetNextWindowPos is inlined away, so the
+// current window is moved after Begin).
+dk2ml::Enum ImGuiWindowFlags_NoDecoration{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoDecoration"};
+dk2ml::Enum ImGuiWindowFlags_NoSavedSettings{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoSavedSettings"};
+dk2ml::Enum ImGuiWindowFlags_NoMouseInputs{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoMouseInputs"};
+dk2ml::Enum ImGuiWindowFlags_NoFocusOnAppearing{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoFocusOnAppearing"};
+dk2ml::Enum ImGuiWindowFlags_NoNav{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoNav"};
+dk2ml::Enum ImGuiCond_Always{"ImGuiCond_", "ImGuiCond_Always"};
+dk2ml::Field<void*> ImGuiContext_CurrentWindow{"ImGuiContext", "CurrentWindow"};
+dk2ml::Fn<void(void* window, const ImVec2* pos, int cond)> ImGui_SetWindowPos{
+    "?SetWindowPos@ImGui@@YAXPEAUImGuiWindow@@AEBUImVec2@@H@Z"};
 dk2ml::Enum ImGuiDataType_Float{"ImGuiDataType_", "ImGuiDataType_Float"};
 dk2ml::Enum ImGuiDataType_S32{"ImGuiDataType_", "ImGuiDataType_S32"};
 
@@ -1103,14 +1134,29 @@ void DestroyResources()
     g_texW = g_texH = 0;
 }
 
-// The corner picture is a quarter of the window wide; same aspect as the window.
+// Where the helmet picture sits, in window pixels measured from the top left: a quarter of the window wide, the window's
+// aspect, in the top right corner. The picture and the name label both use this, so a different anchor, size or quality
+// only has to change it here.
+struct PipRect {
+    int x, yTop, w, h;
+};
+
+PipRect ComputePipRect(int viewW, int viewH)
+{
+    constexpr int kMargin = 16;
+    int w = std::max(64, viewW / 4);
+    int h = std::max(36, static_cast<int>(static_cast<int64_t>(w) * viewH / std::max(viewW, 1)));
+    return {viewW - kMargin - w, kMargin, w, h};
+}
+
 bool EnsureResources(int viewW, int viewH)
 {
     if (!GlReady() || viewW <= 0 || viewH <= 0) {
         return false;
     }
-    int w = std::max(64, viewW / 4);
-    int h = std::max(36, static_cast<int>(static_cast<int64_t>(w) * viewH / viewW));
+    PipRect rect = ComputePipRect(viewW, viewH);
+    int w = rect.w;
+    int h = rect.h;
     if (g_fbo && g_tex && w == g_texW && h == g_texH) {
         return true;
     }
@@ -1251,10 +1297,10 @@ void FillSolid(int code)
 // Our texture into the top-right corner of the back buffer.
 void BlitToCorner(int viewW, int viewH)
 {
-    const int margin = 16;
-    int x1 = viewW - margin;
-    int y1 = viewH - margin; // GL's origin is the bottom left
-    int x0 = x1 - g_texW;
+    PipRect rect = ComputePipRect(viewW, viewH);
+    int x0 = rect.x;
+    int x1 = rect.x + g_texW;
+    int y1 = viewH - rect.yTop; // GL's origin is the bottom left
     int y0 = y1 - g_texH;
 
     GlSaved saved;
@@ -1646,6 +1692,73 @@ void LogOperators()
     }
 }
 
+// The operator's name for the label; see the bindings above for the fallback order. Strings are cut at their field size.
+std::string OperatorLabel(void* human)
+{
+    auto bounded = [](const char* s, size_t max) { return s ? std::string(s, strnlen(s, max)) : std::string(); };
+
+    std::string candidates[4];
+    candidates[0] = bounded(&Human_humanId(human), 48);
+    candidates[1] = bounded(Entity_name(human), 96);
+    if (void* tmpl = Entity_pTemplate(human)) {
+        candidates[2] = bounded(&HumanTemplate_unitName(tmpl), 48);
+        candidates[3] = bounded(&HumanTemplate_className(tmpl), 48);
+    }
+    for (const std::string& c : candidates) {
+        if (c.empty()) {
+            continue;
+        }
+        if (c[0] != '@') {
+            return c;
+        }
+        const char* text = Loca_GetTextForId(c.c_str(), false, false); // null: not a known key, try the next string
+        if (text && text[0]) {
+            return bounded(text, 96);
+        }
+    }
+    return "Operator";
+}
+
+void* TargetHuman()
+{
+    for (void* h : AllHumans()) {
+        if (IsOperator(h) && Entity_id(h) == g_targetId) {
+            return h;
+        }
+    }
+    return nullptr;
+}
+
+// The name at the top left of the helmet picture: a small borderless, click-through ImGui window, placed in window pixels
+// (the same space as the picture). Its default background keeps the text readable on any scene.
+void DrawNameLabel()
+{
+    if (!g_settings.showName || !g_settings.enabled || !g_open || !g_fbo || g_frame.viewW <= 0 || !InMission() ||
+        dk2ml::GameMenuOpen(g_api)) {
+        return;
+    }
+    void* human = TargetHuman();
+    if (!human) {
+        return;
+    }
+
+    std::string label = OperatorLabel(human);
+    int flags = static_cast<int>(ImGuiWindowFlags_NoDecoration.Get() | ImGuiWindowFlags_AlwaysAutoResize.Get() |
+                                 ImGuiWindowFlags_NoSavedSettings.Get() | ImGuiWindowFlags_NoMouseInputs.Get() |
+                                 ImGuiWindowFlags_NoFocusOnAppearing.Get() | ImGuiWindowFlags_NoNav.Get());
+    if (ImGui_Begin("##helmetcam_name", nullptr, flags)) {
+        void* context = GImGui ? *GImGui : nullptr;
+        void* window = context ? dk2ml::At<void*>(context, ImGuiContext_CurrentWindow.Offset()) : nullptr;
+        if (window) {
+            PipRect rect = ComputePipRect(g_frame.viewW, g_frame.viewH);
+            ImVec2 pos = {static_cast<float>(rect.x + 8), static_cast<float>(rect.yTop + 8)};
+            ImGui_SetWindowPos(window, &pos, static_cast<int>(ImGuiCond_Always.Get()));
+        }
+        ImGui_TextEx(label.c_str(), nullptr, 0);
+    }
+    ImGui_End(); // always, whatever Begin returned
+}
+
 void OnFrame(const DK2ML_Event*, void*)
 {
     ApplyEndCameraPan();
@@ -1657,6 +1770,7 @@ void OnFrame(const DK2ML_Event*, void*)
         UpdateAutoTarget();
     }
     DrawSettingsWindow();
+    DrawNameLabel();
 }
 
 void OnStateChanged(const DK2ML_Event* e, void*)
