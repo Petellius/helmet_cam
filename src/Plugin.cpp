@@ -1,0 +1,937 @@
+// Helmet Cam (spike): a first-person picture-in-picture from an operator's head.
+//
+// How it works (one safe hook, no patches):
+//   GameRenderer::RenderGame(viewport, camera)   the game's whole frame, camera and viewport are plain arguments.
+//   Pre : while the cam is open, call RenderGame ourselves first with a camera we build at the operator's head, then
+//         copy the finished image from the back buffer into our own texture (shrunk by the blit). The game's real
+//         RenderGame call follows and overwrites the back buffer with the normal view.
+//   Post: blit our texture into a corner of the back buffer, before the game draws its GUI over it.
+//
+// Spike scope: fixed top-right corner, one operator at a time (hold the key to open or close, tap to cycle),
+// per-second operator logging to find out what a replay keeps alive. Everything else is later.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <GL/gl.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "dk2ml.hpp"
+
+DK2ML_PLUGIN_MANIFEST(DK2ML_API_VERSION, "Helmet Cam", "0.1.0", "Petellius", "", 112);
+
+namespace {
+
+const DK2ML_API* g_api = nullptr;
+
+struct Vec3 {
+    float x, y, z;
+};
+
+// --- the game, by name (checked with symtest --find / --type) ---
+dk2ml::Global<void*> g_pGameClient{"g_pGameClient"};
+dk2ml::Global<void*> g_pRenderer{"g_pRenderer"};
+dk2ml::Field<int> GameClient_m_state{"GameClient", "m_state"};
+dk2ml::Enum StateRunning{"GameClient::eCGameState", "CGAMESTATE_RUNNING"};
+
+// void GameRenderer::RenderGame(const int viewport[4], const Camera& camera)
+dk2ml::Fn<void(void* renderer, const int* viewport, const void* camera)> RenderGame{"GameRenderer::RenderGame"};
+
+// Camera. SetProjectionPerspective(width, height, fov, near, far) is called exactly like this by the game's own
+// GameClient::ToggleFPSCamera (FOV 90, near 0.01, far 100, the viewport size).
+dk2ml::TypeSize Camera_size{"Camera"};
+dk2ml::Fn<void(void* camera)> Camera_SetDefaults{"Camera::SetDefaults"};
+dk2ml::Fn<void(void* camera, float width, float height, float fov, float nearPlane, float farPlane)>
+    Camera_SetProjectionPerspective{"Camera::SetProjectionPerspective"};
+dk2ml::Field<Vec3> Camera_m_pos{"Camera", "m_pos"};
+dk2ml::Field<Vec3> Camera_m_actualPos{"Camera", "m_actualPos"};
+dk2ml::Field<Vec3> Camera_m_rotAngles{"Camera", "m_rotAngles"};
+dk2ml::Field<float> Camera_m_matView{"Camera", "m_matView"}; // Matrix: Vector4[4], row-major, translation in .w
+
+// Humans: a static list of every Human_Client (LinkedList<Human_Client>: head, next, prev, owner).
+dk2ml::Global<uint8_t> Human_typeList{"Human_Client::typeList"};
+dk2ml::Field<void*> LinkedList_head{"LinkedList<Human_Client>", "head"};
+dk2ml::Field<void*> LinkedList_next{"LinkedList<Human_Client>", "next"};
+dk2ml::Field<void*> LinkedList_owner{"LinkedList<Human_Client>", "owner"};
+dk2ml::Field<bool> Human_isControlable{"Human_Client", "m_isControlable"};
+dk2ml::Field<bool> Human_isCrouched{"Human_Client", "m_isCrouched"};
+dk2ml::Field<uint32_t> Human_ownerMask{"Human_Client", "m_ownerMask"};
+dk2ml::Field<Vec3> Human_headDirection{"Human_Client", "m_headDirection"};
+dk2ml::Field<uint32_t> Entity_id{"Entity_Common", "m_id"};
+dk2ml::Field<float> Entity_health{"Entity_Common", "m_health"};
+dk2ml::Field<Vec3> Entity_origin{"Entity_Common", "m_origin"};
+dk2ml::Field<char*> Entity_name{"Entity_Common", "m_szName"};
+
+// Skeleton, to log where the head bone is (the camera itself uses origin + eye height for now).
+dk2ml::Field<void*> Entity_animManager{"Entity_Client", "m_pAnimManager"};
+dk2ml::Field<uint8_t> AnimManager_skeleton{"KHM::CAnimationManager", "m_skeleton"};
+dk2ml::Field<int> Skeleton_numNodes{"KHM::sSkeleton", "numNodes"};
+dk2ml::Field<uint8_t> Skeleton_nodes{"KHM::sSkeleton", "nodes"};
+dk2ml::TypeSize SkeletonNode_size{"KHM::sSkeletonNode"};
+dk2ml::Field<char> SkeletonNode_name{"KHM::sSkeletonNode", "sNodeName"}; // StaticString<48>: the chars come first
+dk2ml::Field<float> SkeletonNode_matGlobal{"KHM::sSkeletonNode", "matGlobal"}; // Matrix3x4: 3 x Vector4
+
+// The game's options (loaded from options.xml): `<DisableCameraPan/>` is this flag.
+dk2ml::Global<uint8_t> Options_game{"Options::game"};
+dk2ml::Field<bool> OptionsGame_disableEndGameCameraPan{"Options::sGame", "disableEndGameCameraPan"};
+
+// OpenGL: the game loads the framebuffer entry points itself, so use its pointers (opengl32 only exports GL 1.1).
+using PFN_GenFramebuffers = void(APIENTRY*)(GLsizei, GLuint*);
+using PFN_DeleteFramebuffers = void(APIENTRY*)(GLsizei, const GLuint*);
+using PFN_BindFramebuffer = void(APIENTRY*)(GLenum, GLuint);
+using PFN_FramebufferTexture2D = void(APIENTRY*)(GLenum, GLenum, GLenum, GLuint, GLint);
+using PFN_CheckFramebufferStatus = GLenum(APIENTRY*)(GLenum);
+using PFN_BlitFramebuffer = void(APIENTRY*)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
+dk2ml::Global<PFN_GenFramebuffers> gl_GenFramebuffers{"glGenFramebuffers"};
+dk2ml::Global<PFN_DeleteFramebuffers> gl_DeleteFramebuffers{"glDeleteFramebuffers"};
+dk2ml::Global<PFN_BindFramebuffer> gl_BindFramebuffer{"glBindFramebuffer"};
+dk2ml::Global<PFN_FramebufferTexture2D> gl_FramebufferTexture2D{"glFramebufferTexture2D"};
+dk2ml::Global<PFN_CheckFramebufferStatus> gl_CheckFramebufferStatus{"glCheckFramebufferStatus"};
+dk2ml::Global<PFN_BlitFramebuffer> gl_BlitFramebuffer{"glBlitFramebuffer"};
+
+// OpenGL's own constants (fixed by the GL spec, not by the game build).
+constexpr GLenum kFramebuffer = 0x8D40;
+constexpr GLenum kReadFramebuffer = 0x8CA8;
+constexpr GLenum kDrawFramebuffer = 0x8CA9;
+constexpr GLenum kReadFramebufferBinding = 0x8CAA;
+constexpr GLenum kDrawFramebufferBinding = 0x8CA6;
+constexpr GLenum kColorAttachment0 = 0x8CE0;
+constexpr GLenum kFramebufferComplete = 0x8CD5;
+constexpr GLenum kTextureBinding2D = 0x8069;
+constexpr GLenum kReadBuffer = 0x0C02;
+constexpr GLenum kSamples = 0x80A9;
+constexpr GLenum kScissorTest = 0x0C11;
+
+// --- settings: packaged defaults (mod\defaults.ini, read only) -> the player's copy (<settings folder>\settings.ini) ---
+struct Settings {
+    bool enabled = true;
+    int key = 0x48; // H (T is the game's troop-list key)
+    int holdMs = 250;
+    float fov = 90.0f;           // degrees, the game's own free-fly camera uses 90
+    float offsetForward = 0.10f; // metres ahead of the entity, along the gaze
+    float offsetUp = 0.0f;       // metres added to the head height (1.58 standing, 1.14 crouched)
+    int testPicture = 0;         // debug: 0 helmet view, 1 mirror of the main view, 2 solid color
+    bool logOperators = false;
+    bool anyHuman = false;       // debug: every human counts as an operator
+    bool panManaged = false;     // the player changed the end-of-mission pan option, so the mod sets it
+    bool disableEndCameraPan = false;
+};
+
+Settings g_defaults;
+Settings g_settings;
+std::wstring g_settingsFile; // empty: no settings folder, defaults only
+
+const wchar_t* kSection = L"helmet_cam";
+
+int ReadInt(const std::wstring& file, const wchar_t* key, int fallback)
+{
+    wchar_t buf[32] = {};
+    GetPrivateProfileStringW(kSection, key, L"", buf, 32, file.c_str());
+    return buf[0] ? static_cast<int>(wcstol(buf, nullptr, 0)) : fallback; // base 0: 0x54 or 84
+}
+
+void ReadFloat(const std::wstring& file, const wchar_t* key, float& value)
+{
+    wchar_t buf[32] = {}; // the profile API has no float reader
+    GetPrivateProfileStringW(kSection, key, L"", buf, 32, file.c_str());
+    if (buf[0]) {
+        value = static_cast<float>(_wtof(buf));
+    }
+}
+
+void ReadIni(const std::wstring& file, Settings& s)
+{
+    ReadFloat(file, L"fov", s.fov);
+    ReadFloat(file, L"offset_forward", s.offsetForward);
+    ReadFloat(file, L"offset_up", s.offsetUp);
+    s.fov = std::clamp(s.fov, 30.0f, 120.0f);
+    s.offsetForward = std::clamp(s.offsetForward, -0.5f, 1.0f);
+    s.offsetUp = std::clamp(s.offsetUp, -0.5f, 0.5f);
+    s.enabled = ReadInt(file, L"enabled", s.enabled) != 0;
+    s.key = ReadInt(file, L"key", s.key);
+    s.holdMs = std::clamp(ReadInt(file, L"hold_ms", s.holdMs), 100, 1000);
+    s.testPicture = std::clamp(ReadInt(file, L"test_picture", s.testPicture), 0, 2);
+    s.logOperators = ReadInt(file, L"log_operators", s.logOperators) != 0;
+    s.anyHuman = ReadInt(file, L"any_human", s.anyHuman) != 0;
+    int pan = ReadInt(file, L"disable_end_camera_pan", s.panManaged ? (s.disableEndCameraPan ? 1 : 0) : -1);
+    s.panManaged = pan >= 0;
+    s.disableEndCameraPan = pan > 0;
+}
+
+void SaveSettings(const DK2ML_Option*, void*)
+{
+    if (g_settingsFile.empty()) {
+        return;
+    }
+
+    auto write = [](const wchar_t* key, int v) {
+        wchar_t buf[32];
+        swprintf_s(buf, L"%d", v);
+        WritePrivateProfileStringW(kSection, key, buf, g_settingsFile.c_str());
+    };
+
+    auto writeFloat = [](const wchar_t* key, float v) {
+        wchar_t buf[32];
+        swprintf_s(buf, L"%.3f", v);
+        WritePrivateProfileStringW(kSection, key, buf, g_settingsFile.c_str());
+    };
+    writeFloat(L"fov", g_settings.fov);
+    writeFloat(L"offset_forward", g_settings.offsetForward);
+    writeFloat(L"offset_up", g_settings.offsetUp);
+
+    write(L"enabled", g_settings.enabled);
+    write(L"key", g_settings.key);
+    write(L"hold_ms", g_settings.holdMs);
+    write(L"test_picture", g_settings.testPicture);
+    write(L"log_operators", g_settings.logOperators);
+    write(L"any_human", g_settings.anyHuman);
+    write(L"disable_end_camera_pan", g_settings.panManaged ? (g_settings.disableEndCameraPan ? 1 : 0) : -1);
+}
+
+void LoadSettings(const DK2ML_PluginInfo* info)
+{
+    if (info && info->modDir && info->modDir[0]) {
+        ReadIni(std::wstring(info->modDir) + L"defaults.ini", g_defaults); // read only (R16)
+    }
+
+    g_settings = g_defaults;
+
+    const wchar_t* dir = g_api->GetConfigDir();
+    if (!dir[0]) {
+        return; // no settings folder: packaged defaults only
+    }
+
+    g_settingsFile = std::wstring(dir) + L"settings.ini"; // not the mod folder, which Steam replaces (R16)
+    if (GetFileAttributesW(g_settingsFile.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        ReadIni(g_settingsFile, g_settings);
+    } else {
+        SaveSettings(nullptr, nullptr); // first run: seed the player's copy from the packaged defaults
+    }
+}
+
+void OnPanChanged(const DK2ML_Option*, void*)
+{
+    g_settings.panManaged = true; // from now on the mod sets the game's flag
+    SaveSettings(nullptr, nullptr);
+}
+
+void OnReset(const DK2ML_Option*, void*)
+{
+    g_settings = g_defaults;
+    SaveSettings(nullptr, nullptr);
+    g_api->Log("settings reset to the packaged defaults");
+}
+
+void AddOptions()
+{
+    auto add = [](DK2ML_Option o) { g_api->AddOption(&o); };
+
+    add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER,
+         "Helmet Cam - WARNING: renders the scene a second time while open, expect a lower frame rate"});
+
+    DK2ML_Option enabled = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Enable Helmet Cam",
+                            "Master switch. Off: the key does nothing and nothing extra is rendered",
+                            &g_settings.enabled};
+    enabled.onChange = SaveSettings;
+    add(enabled);
+
+    DK2ML_Option key = {sizeof(DK2ML_Option), DK2ML_OPTION_KEY, "Helmet cam key",
+                        "Hold to open or close the helmet cam, tap to switch to the next operator",
+                        &g_settings.key};
+    key.onChange = SaveSettings;
+    add(key);
+
+    DK2ML_Option hold = {sizeof(DK2ML_Option), DK2ML_OPTION_INT, "Hold time",
+                         "How long the key is held to open or close the helmet cam; a shorter press is a tap",
+                         &g_settings.holdMs, 100.0f, 1000.0f, "%d ms"};
+    hold.onChange = SaveSettings;
+    add(hold);
+
+    add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Camera"});
+
+    auto slider = [&](const char* label, const char* tip, float* value, float lo, float hi, const char* fmt) {
+        DK2ML_Option o = {sizeof(DK2ML_Option), DK2ML_OPTION_FLOAT, label, tip, value, lo, hi, fmt};
+        o.onChange = SaveSettings;
+        add(o);
+    };
+    slider("Field of view", "How wide the helmet cam sees, in degrees; the game's own free camera uses 90",
+           &g_settings.fov, 30.0f, 120.0f, "%.0f deg");
+    slider("Forward offset", "Moves the camera ahead of the operator (negative: behind), in metres", &g_settings.offsetForward,
+           -0.5f, 1.0f, "%.2f m");
+    slider("Height offset", "Raises or lowers the camera from the head height (1.58 m standing, 1.14 m crouched)",
+           &g_settings.offsetUp, -0.5f, 0.5f, "%.2f m");
+
+    add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Game"});
+
+    DK2ML_Option pan = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Disable end-of-mission camera pan",
+                        "Skips the camera pulling out at the end of a mission or replay (the game's DisableCameraPan)",
+                        &g_settings.disableEndCameraPan};
+    pan.onChange = OnPanChanged;
+    add(pan);
+
+    add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Debug"});
+
+    static const char* const kTestPictures[] = {"Off (helmet view)", "Mirror the main view", "Solid color"};
+    DK2ML_Option test = {sizeof(DK2ML_Option), DK2ML_OPTION_CHOICE, "Test picture",
+                         "Finds why the picture is black: 'Mirror' shows a shrunk copy of the normal view in the corner, "
+                         "'Solid color' a flat color. Neither renders the helmet view"};
+    test.value = &g_settings.testPicture;
+    test.choices = kTestPictures;
+    test.choiceCount = 3;
+    test.onChange = SaveSettings;
+    add(test);
+
+    DK2ML_Option log = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Log operators",
+                        "Once a second in a mission or replay, write every human's position, health and head bone to dk2ml.log",
+                        &g_settings.logOperators};
+    log.onChange = SaveSettings;
+    add(log);
+
+    DK2ML_Option any = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Any human counts as an operator",
+                        "For testing: cycle through every human, not just the ones you control", &g_settings.anyHuman};
+    any.onChange = SaveSettings;
+    add(any);
+
+    DK2ML_Option reset = {sizeof(DK2ML_Option), DK2ML_OPTION_BUTTON, "Reset to defaults",
+                          "Restores the values this mod shipped with"};
+    reset.onChange = OnReset;
+    add(reset);
+}
+
+// --- game state helpers (main thread only) ---
+bool InMission()
+{
+    void* client = g_pGameClient ? *g_pGameClient : nullptr;
+    return client && GameClient_m_state(client) == StateRunning.Get();
+}
+
+// Every Human_Client, in list order. The list ends where a link's next equals the list's head.
+std::vector<void*> AllHumans()
+{
+    std::vector<void*> out;
+    void* list = Human_typeList.Address();
+    if (!list) {
+        return out;
+    }
+    void* end = dk2ml::At<void*>(list, LinkedList_head.Offset());
+    void* node = dk2ml::At<void*>(list, LinkedList_next.Offset());
+    for (int guard = 0; node && node != end && node != list && guard < 1024; ++guard) {
+        void* human = dk2ml::At<void*>(node, LinkedList_owner.Offset());
+        if (human) {
+            out.push_back(human);
+        }
+        node = dk2ml::At<void*>(node, LinkedList_next.Offset());
+    }
+    return out;
+}
+
+bool IsOperator(void* human)
+{
+    return g_settings.anyHuman || Human_isControlable(human);
+}
+
+bool IsAlive(void* human)
+{
+    return Entity_health(human) > 0.0f;
+}
+
+// The head bone's matGlobal (3 rows of 4 floats), or null. Logging only.
+const float* HeadBone(void* human)
+{
+    void* anim = Entity_animManager(human);
+    if (!anim) {
+        return nullptr;
+    }
+    char* skeleton = static_cast<char*>(anim) + AnimManager_skeleton.Offset();
+    int count = dk2ml::At<int>(skeleton, Skeleton_numNodes.Offset());
+    if (count <= 0 || count > 64) {
+        return nullptr;
+    }
+    char* nodes = skeleton + Skeleton_nodes.Offset();
+    for (int i = 0; i < count; ++i) {
+        char* node = nodes + static_cast<size_t>(i) * SkeletonNode_size.Get();
+        if (std::strncmp(node + SkeletonNode_name.Offset(), "Bip001 Head", 48) == 0) {
+            return reinterpret_cast<const float*>(node + SkeletonNode_matGlobal.Offset());
+        }
+    }
+    return nullptr;
+}
+
+// --- the cam: which operator, open or closed ---
+bool g_open = false;
+uint32_t g_targetId = 0;       // Entity_Common::m_id of the operator we show; 0 = none yet
+bool g_cycleRequested = false;
+
+void ResetCam()
+{
+    g_open = false;
+    g_targetId = 0;
+    g_cycleRequested = false;
+}
+
+// The operator to show, or null. `alive` is false when the cam should be black: that operator died (the cam stays
+// on them), or nobody is left.
+void* FindTarget(bool& alive)
+{
+    alive = false;
+    std::vector<void*> ops;
+    for (void* h : AllHumans()) {
+        if (IsOperator(h)) {
+            ops.push_back(h);
+        }
+    }
+    if (ops.empty()) {
+        return nullptr;
+    }
+
+    int current = -1;
+    for (size_t i = 0; i < ops.size(); ++i) {
+        if (Entity_id(ops[i]) == g_targetId) {
+            current = static_cast<int>(i);
+        }
+    }
+
+    if (g_cycleRequested || current < 0) {
+        // Next living operator after the current one (the first one when there is none): dead operators are skipped.
+        // No living operator leaves the target alone, so a dead target stays on a black cam.
+        g_cycleRequested = false;
+        int n = static_cast<int>(ops.size());
+        for (int k = 1; k <= n; ++k) {
+            int candidate = (current + k + n) % n;
+            if (IsAlive(ops[candidate])) {
+                current = candidate;
+                g_targetId = Entity_id(ops[candidate]);
+                break;
+            }
+        }
+    }
+
+    if (current < 0) {
+        return nullptr;
+    }
+    alive = IsAlive(ops[current]);
+    return ops[current];
+}
+
+// --- GL resources: a texture the size of the corner picture, and a framebuffer around it ---
+GLuint g_tex = 0;
+GLuint g_fbo = 0;
+int g_texW = 0;
+int g_texH = 0;
+int g_texFill = -1; // what the texture holds: -1 an image (or unknown), 0 black, 1 magenta
+std::vector<unsigned char> g_fillPixels;
+
+// GL errors are logged for the first few passes after the cam opens, tagged with the stage that raised them. The
+// queue is drained before our own steps, so the game's leftovers are told apart from ours.
+int g_glLogBudget = 0;
+
+void GlStage(const char* stage)
+{
+    for (int i = 0; i < 8; ++i) {
+        GLenum e = glGetError();
+        if (e == GL_NO_ERROR) {
+            return;
+        }
+        if (g_glLogBudget > 0) {
+            --g_glLogBudget;
+            g_api->Log("helmet cam: GL error 0x%X %s", e, stage);
+        }
+    }
+}
+
+struct GlSaved {
+    GLint readFb = 0, drawFb = 0, tex = 0;
+    GLboolean scissor = GL_FALSE;
+};
+
+void SaveGl(GlSaved& s)
+{
+    glGetIntegerv(kReadFramebufferBinding, &s.readFb);
+    glGetIntegerv(kDrawFramebufferBinding, &s.drawFb);
+    glGetIntegerv(kTextureBinding2D, &s.tex);
+    s.scissor = glIsEnabled(kScissorTest);
+}
+
+void RestoreGl(const GlSaved& s)
+{
+    (*gl_BindFramebuffer)(kReadFramebuffer, static_cast<GLuint>(s.readFb));
+    (*gl_BindFramebuffer)(kDrawFramebuffer, static_cast<GLuint>(s.drawFb));
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(s.tex));
+    if (s.scissor) {
+        glEnable(kScissorTest);
+    }
+}
+
+bool GlReady()
+{
+    return *gl_GenFramebuffers && *gl_BindFramebuffer && *gl_FramebufferTexture2D && *gl_CheckFramebufferStatus &&
+           *gl_BlitFramebuffer;
+}
+
+void DestroyResources()
+{
+    if (g_fbo && *gl_DeleteFramebuffers) {
+        (*gl_DeleteFramebuffers)(1, &g_fbo);
+    }
+    if (g_tex) {
+        glDeleteTextures(1, &g_tex);
+    }
+    g_fbo = 0;
+    g_tex = 0;
+    g_texW = g_texH = 0;
+}
+
+// The corner picture is a quarter of the window wide; same aspect as the window.
+bool EnsureResources(int viewW, int viewH)
+{
+    if (!GlReady() || viewW <= 0 || viewH <= 0) {
+        return false;
+    }
+    int w = std::max(64, viewW / 4);
+    int h = std::max(36, static_cast<int>(static_cast<int64_t>(w) * viewH / viewW));
+    if (g_fbo && g_tex && w == g_texW && h == g_texH) {
+        return true;
+    }
+
+    GlSaved saved;
+    SaveGl(saved);
+    DestroyResources();
+
+    glGenTextures(1, &g_tex);
+    glBindTexture(GL_TEXTURE_2D, g_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    (*gl_GenFramebuffers)(1, &g_fbo);
+    (*gl_BindFramebuffer)(kFramebuffer, g_fbo);
+    (*gl_FramebufferTexture2D)(kFramebuffer, kColorAttachment0, GL_TEXTURE_2D, g_tex, 0);
+    GLenum status = (*gl_CheckFramebufferStatus)(kFramebuffer);
+    RestoreGl(saved);
+
+    if (status != kFramebufferComplete) {
+        g_api->Log("helmet cam: framebuffer %dx%d incomplete (0x%X), cam off", w, h, status);
+        DestroyResources();
+        return false;
+    }
+    GlStage("while creating the texture and framebuffer");
+    g_texW = w;
+    g_texH = h;
+    g_texFill = -1;
+    g_api->Log("helmet cam: %dx%d picture for a %dx%d window", w, h, viewW, viewH);
+    return true;
+}
+
+// A full-window, single-sample copy of the back buffer. Only used when the back buffer is multisampled: GL refuses to
+// scale a multisampled source (INVALID_OPERATION), so it is resolved 1:1 first and shrunk from here.
+GLuint g_fullTex = 0;
+GLuint g_fullFbo = 0;
+int g_fullW = 0;
+int g_fullH = 0;
+int g_backSamples = -1; // samples per pixel of the default framebuffer, read on the first capture
+
+bool EnsureFullCopy(int w, int h)
+{
+    if (g_fullFbo && g_fullW == w && g_fullH == h) {
+        return true;
+    }
+    GlSaved saved;
+    SaveGl(saved);
+    if (g_fullFbo) {
+        (*gl_DeleteFramebuffers)(1, &g_fullFbo);
+        g_fullFbo = 0;
+    }
+    if (g_fullTex) {
+        glDeleteTextures(1, &g_fullTex);
+        g_fullTex = 0;
+    }
+    glGenTextures(1, &g_fullTex);
+    glBindTexture(GL_TEXTURE_2D, g_fullTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    (*gl_GenFramebuffers)(1, &g_fullFbo);
+    (*gl_BindFramebuffer)(kFramebuffer, g_fullFbo);
+    (*gl_FramebufferTexture2D)(kFramebuffer, kColorAttachment0, GL_TEXTURE_2D, g_fullTex, 0);
+    GLenum status = (*gl_CheckFramebufferStatus)(kFramebuffer);
+    RestoreGl(saved);
+    if (status != kFramebufferComplete) {
+        g_api->Log("helmet cam: full-size copy %dx%d incomplete (0x%X)", w, h, status);
+        (*gl_DeleteFramebuffers)(1, &g_fullFbo);
+        glDeleteTextures(1, &g_fullTex);
+        g_fullFbo = g_fullTex = 0;
+        return false;
+    }
+    g_fullW = w;
+    g_fullH = h;
+    return true;
+}
+
+// The finished frame is in the back buffer: shrink it into our texture.
+void CaptureBackBuffer(int viewW, int viewH)
+{
+    GlSaved saved;
+    SaveGl(saved);
+    glDisable(kScissorTest);
+
+    // The default framebuffer's read buffer is state the game may have changed (GL_NONE would make every blit from
+    // it INVALID_OPERATION), so name the back buffer explicitly and put the old value back afterwards.
+    (*gl_BindFramebuffer)(kReadFramebuffer, 0);
+    GLint previousRead = GL_BACK;
+    glGetIntegerv(kReadBuffer, &previousRead);
+    if (g_backSamples < 0) {
+        GLint samples = 0;
+        glGetIntegerv(kSamples, &samples);
+        g_backSamples = samples;
+        g_api->Log("helmet cam: back buffer has %d samples, its read buffer was 0x%X", samples, previousRead);
+    }
+    glReadBuffer(GL_BACK);
+    GlStage("while preparing to read the back buffer");
+
+    if (g_backSamples > 0 && EnsureFullCopy(viewW, viewH)) {
+        (*gl_BindFramebuffer)(kDrawFramebuffer, g_fullFbo);
+        (*gl_BlitFramebuffer)(0, 0, viewW, viewH, 0, 0, viewW, viewH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        GlStage("in the full-size resolve blit");
+        (*gl_BindFramebuffer)(kReadFramebuffer, g_fullFbo);
+    }
+    (*gl_BindFramebuffer)(kDrawFramebuffer, g_fbo);
+    (*gl_BlitFramebuffer)(0, 0, viewW, viewH, 0, 0, g_texW, g_texH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+    (*gl_BindFramebuffer)(kReadFramebuffer, 0);
+    glReadBuffer(static_cast<GLenum>(previousRead));
+    RestoreGl(saved);
+    g_texFill = -1;
+}
+
+// 0: opaque black (a dead operator, or nobody left), 1: opaque magenta (the solid-color test).
+void FillSolid(int code)
+{
+    if (g_texFill == code) {
+        return;
+    }
+    GlSaved saved;
+    SaveGl(saved);
+    const unsigned char r = code == 1 ? 255 : 0;
+    const unsigned char b = code == 1 ? 255 : 0;
+    g_fillPixels.resize(static_cast<size_t>(g_texW) * g_texH * 4);
+    for (size_t i = 0; i < g_fillPixels.size(); i += 4) {
+        g_fillPixels[i] = r;
+        g_fillPixels[i + 1] = 0;
+        g_fillPixels[i + 2] = b;
+        g_fillPixels[i + 3] = 255;
+    }
+    glBindTexture(GL_TEXTURE_2D, g_tex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g_texW, g_texH, GL_RGBA, GL_UNSIGNED_BYTE, g_fillPixels.data());
+    RestoreGl(saved);
+    g_texFill = code;
+}
+
+// Our texture into the top-right corner of the back buffer.
+void BlitToCorner(int viewW, int viewH)
+{
+    const int margin = 16;
+    int x1 = viewW - margin;
+    int y1 = viewH - margin; // GL's origin is the bottom left
+    int x0 = x1 - g_texW;
+    int y0 = y1 - g_texH;
+
+    GlSaved saved;
+    SaveGl(saved);
+    glDisable(kScissorTest);
+    (*gl_BindFramebuffer)(kReadFramebuffer, g_fbo);
+    (*gl_BindFramebuffer)(kDrawFramebuffer, 0);
+    (*gl_BlitFramebuffer)(0, 0, g_texW, g_texH, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    RestoreGl(saved);
+}
+
+// --- the camera at the operator's head ---
+alignas(16) unsigned char g_camera[1024];
+int g_helmetFrames = 0; // how many passes were logged in detail
+
+Vec3 Sub(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+float Dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 Cross(Vec3 a, Vec3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+Vec3 Normalize(Vec3 v)
+{
+    float len = std::sqrt(Dot(v, v));
+    return len > 1e-5f ? Vec3{v.x / len, v.y / len, v.z / len} : Vec3{0.0f, 0.0f, -1.0f};
+}
+
+// A look-at view matrix for the game's world: Y is up and the ground is X/Z (every human's origin is (x, 0, z)).
+// Stored the way the game stores its own, which the log showed for the top-down camera: row-major, rows right / up /
+// -forward, translation in the fourth column = -(row . position).
+void BuildCamera(void* human, const int* viewport, Vec3& eyeOut, Vec3& fwdOut)
+{
+    std::memset(g_camera, 0, sizeof(g_camera));
+    Camera_SetDefaults(g_camera);
+    Camera_SetProjectionPerspective(g_camera, static_cast<float>(viewport[2]), static_cast<float>(viewport[3]),
+                                    g_settings.fov, 0.05f, 100.0f);
+
+    Vec3 look = Human_headDirection(human);
+    look.y = 0.0f; // level gaze for now; pitch comes later
+    Vec3 f = Normalize(look);
+
+    // The origin is on the floor. The head bone sits 1.58 above it standing and 1.14 crouched (from the logged bones);
+    // the player's offsets move the camera from there (by default a little ahead, so it isn't inside the head).
+    Vec3 eye = Entity_origin(human);
+    eye.y += (Human_isCrouched(human) ? 1.14f : 1.58f) + g_settings.offsetUp;
+    eye.x += f.x * g_settings.offsetForward;
+    eye.z += f.z * g_settings.offsetForward;
+
+    Vec3 up = {0.0f, 1.0f, 0.0f};
+    Vec3 r = Normalize(Cross(f, up));
+    Vec3 u = Cross(r, f);
+
+    float* m = &Camera_m_matView(g_camera);
+    float rows[4][4] = {
+        {r.x, r.y, r.z, -Dot(r, eye)},
+        {u.x, u.y, u.z, -Dot(u, eye)},
+        {-f.x, -f.y, -f.z, Dot(f, eye)},
+        {0.0f, 0.0f, 0.0f, 1.0f},
+    };
+    std::memcpy(m, rows, sizeof(rows));
+
+    Camera_m_pos(g_camera) = eye;
+    Camera_m_actualPos(g_camera) = eye;
+    eyeOut = eye;
+    fwdOut = f;
+}
+
+// --- the hook ---
+thread_local bool t_inHelmetPass = false;
+
+struct FrameInfo {
+    bool active = false; // a corner picture is due after this RenderGame
+    int viewW = 0, viewH = 0;
+} g_frame;
+
+int RenderGamePre(DK2ML_Regs* regs, void*)
+{
+    if (t_inHelmetPass) {
+        return DK2ML_CALL_ORIGINAL; // our own nested call
+    }
+    g_frame.active = false;
+    if (!g_settings.enabled || !g_open || !InMission()) {
+        return DK2ML_CALL_ORIGINAL;
+    }
+
+    void* renderer = dk2ml::Arg<void*>(regs, 0);
+    const int* viewport = dk2ml::Arg<const int*>(regs, 1);
+    const void* mainCamera = dk2ml::Arg<const void*>(regs, 2);
+    GlStage("left over from the game, before our pass (not ours)");
+    if (!renderer || !viewport || !EnsureResources(viewport[2], viewport[3])) {
+        return DK2ML_CALL_ORIGINAL;
+    }
+
+    // Test pictures leave the helmet view out: 1 captures the finished normal frame in the post hook, 2 is a flat color.
+    if (g_settings.testPicture == 2) {
+        FillSolid(1);
+        g_frame.active = true;
+        g_frame.viewW = viewport[2];
+        g_frame.viewH = viewport[3];
+        return DK2ML_CALL_ORIGINAL;
+    }
+    if (g_settings.testPicture == 1) {
+        g_frame.active = true;
+        g_frame.viewW = viewport[2];
+        g_frame.viewH = viewport[3];
+        return DK2ML_CALL_ORIGINAL;
+    }
+
+    bool alive = false;
+    void* target = FindTarget(alive);
+    if (target && alive) {
+        Vec3 eye, fwd;
+        BuildCamera(target, viewport, eye, fwd);
+
+        t_inHelmetPass = true;
+        RenderGame(renderer, viewport, g_camera);
+        t_inHelmetPass = false;
+        GlStage("in the nested RenderGame");
+
+        CaptureBackBuffer(viewport[2], viewport[3]);
+        GlStage("in the back buffer capture blit");
+
+        if (g_helmetFrames < 3) {
+            ++g_helmetFrames;
+            const float* mv = &Camera_m_matView(g_camera);
+            const float* gv = mainCamera ? &Camera_m_matView(mainCamera) : nullptr;
+            g_api->Log("helmet pass %d: operator %u eye (%.2f %.2f %.2f) facing (%.2f %.2f %.2f)", g_helmetFrames,
+                       Entity_id(target), eye.x, eye.y, eye.z, fwd.x, fwd.y, fwd.z);
+            g_api->Log("  our view: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", mv[0], mv[1],
+                       mv[2], mv[3], mv[4], mv[5], mv[6], mv[7], mv[8], mv[9], mv[10], mv[11]);
+            if (gv) {
+                g_api->Log("  game view: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", gv[0], gv[1],
+                           gv[2], gv[3], gv[4], gv[5], gv[6], gv[7], gv[8], gv[9], gv[10], gv[11]);
+            }
+        }
+    } else {
+        FillSolid(0); // the operator died, or nobody is left: a black picture
+    }
+
+    g_frame.active = true;
+    g_frame.viewW = viewport[2];
+    g_frame.viewH = viewport[3];
+    return DK2ML_CALL_ORIGINAL;
+}
+
+void RenderGamePost(DK2ML_Regs*, void*)
+{
+    if (t_inHelmetPass || !g_frame.active) {
+        return;
+    }
+    g_frame.active = false;
+    if (!g_fbo) {
+        return;
+    }
+    GlStage("left by the game's own frame (not ours)");
+    if (g_settings.testPicture == 1) {
+        CaptureBackBuffer(g_frame.viewW, g_frame.viewH); // the normal frame is finished: shrink a copy of it
+        GlStage("in the mirror capture blit");
+    }
+    BlitToCorner(g_frame.viewW, g_frame.viewH);
+    GlStage("in the corner blit");
+}
+
+// --- events ---
+bool g_keyWasDown = false;
+bool g_keyIgnored = false;  // pressed while Ctrl or Alt was held: another mod's or the game's combination (R27)
+bool g_keyConsumed = false; // this press already did its hold action
+ULONGLONG g_keyPressedAt = 0;
+
+void HandleKey()
+{
+    bool usable = g_settings.enabled && g_settings.key && InMission() && g_api->IsGameFocused() &&
+                  !g_api->IsGameMenuOpen();
+    bool down = usable && (GetAsyncKeyState(g_settings.key) & 0x8000) != 0;
+    bool vkIsModifier = g_settings.key == VK_CONTROL || g_settings.key == VK_MENU;
+    bool chord = !vkIsModifier && ((GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_MENU)) & 0x8000) != 0;
+    ULONGLONG now = GetTickCount64();
+
+    if (down && !g_keyWasDown) {
+        g_keyIgnored = chord; // a key held through a combination waits for its next press
+        g_keyConsumed = false;
+        g_keyPressedAt = now;
+    }
+
+    if (down && !g_keyIgnored && !g_keyConsumed && now - g_keyPressedAt >= static_cast<ULONGLONG>(g_settings.holdMs)) {
+        g_keyConsumed = true;
+        g_open = !g_open; // hold: open or close
+        if (g_open) {
+            g_helmetFrames = 0;
+            g_glLogBudget = 12;
+        }
+        g_api->Log("helmet cam %s", g_open ? "opened" : "closed");
+    }
+
+    if (!down && g_keyWasDown && !g_keyIgnored && !g_keyConsumed && g_open) {
+        g_cycleRequested = true; // tap while open: next operator. A tap while closed does nothing.
+    }
+
+    g_keyWasDown = down;
+}
+
+// The game loads options.xml after the plugin's init, so the flag is read and written from frames on.
+void ApplyEndCameraPan()
+{
+    uint8_t* game = Options_game.Address();
+    if (!game) {
+        return;
+    }
+    bool& flag = OptionsGame_disableEndGameCameraPan(game);
+    if (!g_settings.panManaged) {
+        g_settings.disableEndCameraPan = flag; // show the game's own setting until the player picks one
+        return;
+    }
+    flag = g_settings.disableEndCameraPan;
+}
+
+ULONGLONG g_lastLog = 0;
+
+void LogOperators()
+{
+    ULONGLONG now = GetTickCount64();
+    if (now - g_lastLog < 1000) {
+        return;
+    }
+    g_lastLog = now;
+
+    std::vector<void*> humans = AllHumans();
+    g_api->Log("-- %zu humans, replaying=%d, cam open=%d target=%u --", humans.size(), dk2ml::IsReplaying(g_api),
+               g_open, g_targetId);
+    for (void* h : humans) {
+        const char* name = Entity_name(h);
+        Vec3 o = Entity_origin(h);
+        Vec3 d = Human_headDirection(h);
+        g_api->Log("  id %u '%s' ctrl=%d owner=0x%X hp=%.0f crouch=%d origin (%.2f %.2f %.2f) head dir (%.2f %.2f %.2f)",
+                   Entity_id(h), name ? name : "", Human_isControlable(h), Human_ownerMask(h), Entity_health(h),
+                   Human_isCrouched(h), o.x, o.y, o.z, d.x, d.y, d.z);
+        if (const float* b = HeadBone(h)) {
+            g_api->Log("    head bone: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", b[0], b[1], b[2],
+                       b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11]);
+        } else {
+            g_api->Log("    no head bone (anim manager %p)", Entity_animManager(h));
+        }
+    }
+}
+
+void OnFrame(const DK2ML_Event*, void*)
+{
+    ApplyEndCameraPan();
+    if (g_settings.logOperators && InMission()) {
+        LogOperators();
+    }
+    HandleKey();
+}
+
+void OnStateChanged(const DK2ML_Event* e, void*)
+{
+    if (e->newState != StateRunning.Get()) {
+        if (g_open) {
+            g_api->Log("helmet cam closed: left the mission");
+        }
+        ResetCam();
+    }
+}
+
+void OnMapLoaded(const DK2ML_Event*, void*)
+{
+    ResetCam(); // a restart or a new mission: the old operators are gone
+    g_helmetFrames = 0;
+}
+
+} // namespace
+
+DK2ML_EXPORT int DK2ML_PluginInit(const DK2ML_API* api, const DK2ML_PluginInfo* info)
+{
+    g_api = api;
+    LoadSettings(info);
+
+    if (!dk2ml::ResolveAll(api)) { // logs every name this game build doesn't have
+        return 1;
+    }
+    if (Camera_size.Get() > sizeof(g_camera)) {
+        api->Log("Camera is %u bytes, more than the %zu reserved", Camera_size.Get(), sizeof(g_camera));
+        return 2;
+    }
+
+    AddOptions();
+
+    if (!dk2ml::On(api, DK2ML_EVENT_FRAME, OnFrame) || !dk2ml::On(api, DK2ML_EVENT_STATE_CHANGED, OnStateChanged) ||
+        !dk2ml::On(api, DK2ML_EVENT_MAP_LOADED, OnMapLoaded)) {
+        return 3;
+    }
+    if (!dk2ml::Hook(api, RenderGame, RenderGamePre, RenderGamePost)) {
+        return 4;
+    }
+
+    api->Log("ready (spike): hold vk=0x%X for %d ms to open or close the cam, tap to cycle", g_settings.key,
+             g_settings.holdMs);
+    return 0;
+}

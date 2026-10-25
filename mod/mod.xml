@@ -1,0 +1,9 @@
+<Mod
+	title="Helmet Cam"
+	description="Work in progress: a first-person helmet camera picture-in-picture for allied operators, in missions and replays. Requires the Door Kickers 2 Modloader (dk2ml.dll and dbghelp.dll in the game folder)."
+	author="Petellius"
+	tags="Other"
+	changeNotes=""
+	languageMod=""
+	gameVersion="112"
+/>
