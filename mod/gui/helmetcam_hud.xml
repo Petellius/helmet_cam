@@ -1,0 +1,141 @@
+<!--
+The Helmet Cam widget, built like Free Camera's wheel: one main icon per HUD bar (the plugin moves each into its bar:
+HUD, or HUD_Replay_Full in replays, so origins are relative to it) and one arc of four buttons that the plugin moves into
+the icon in use while the arc is open. Clicking the icon opens the arc and clicking it again closes it. Each arc control
+is two Buttons, _a and _b, one per state; the plugin shows the matching one and handles the clicks. The icon is drawn 15%
+smaller than its 104 px art (88 px). A separate file, so hud.xml stays the game's and other mods'. Names are prefixed
+(#helmetcam_). The arc: radius 200 around the icon, 96 px buttons at 150, 110, 70 and 30 degrees.
+-->
+<GUIItems>
+	<Item name="#helmetcam_menu" origin="594 0" hidden="true">
+		<Button name="#helmetcam_menu_off" sizeX="88" sizeY="88" tooltip="Helmet Cam (click for options)">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_a_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_a_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_a_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_menu"/>
+			</OnClick>
+		</Button>
+		<Button name="#helmetcam_menu_on" sizeX="88" sizeY="88" hidden="true" tooltip="Helmet Cam: open (click for options)">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_b_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_b_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_b_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_menu"/>
+			</OnClick>
+		</Button>
+	</Item>
+
+	<Item name="#helmetcam_menu_replay" origin="776 0" hidden="true">
+		<Button name="#helmetcam_menu_replay_off" sizeX="88" sizeY="88" tooltip="Helmet Cam (click for options)">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_a_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_a_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_a_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_menu_replay"/>
+			</OnClick>
+		</Button>
+		<Button name="#helmetcam_menu_replay_on" sizeX="88" sizeY="88" hidden="true" tooltip="Helmet Cam: open (click for options)">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_b_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_b_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_menu_b_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_menu_replay"/>
+			</OnClick>
+		</Button>
+	</Item>
+
+	<Item name="#helmetcam_wheel" hidden="true">
+		<StaticImage origin="0 130">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_wheel_ring.dds" color="ffffff7f"/>
+		</StaticImage>
+		<Button name="#helmetcam_wheel_select_a" origin="-173 100" sizeX="96" sizeY="96" tooltip="Selection: switches on key press. Click to switch instantly when you select an operator">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_select_a_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_select_a_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_select_a_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_wheel"/>
+			</OnClick>
+		</Button>
+		<Button name="#helmetcam_wheel_select_b" origin="-173 100" sizeX="96" sizeY="96" hidden="true" tooltip="Selection: instant, the helmet cam follows your selection. Click to switch only on key press">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_select_b_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_select_b_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_select_b_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_wheel"/>
+			</OnClick>
+		</Button>
+		<Button name="#helmetcam_wheel_lock_a" origin="-68 188" sizeX="96" sizeY="96" tooltip="Lock: off. Click to lock the helmet cam to the selected operator">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_a_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_a_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_a_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_wheel"/>
+			</OnClick>
+		</Button>
+		<Button name="#helmetcam_wheel_lock_b" origin="-68 188" sizeX="96" sizeY="96" hidden="true" tooltip="Lock: on. Click to unlock the helmet cam">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_b_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_b_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_b_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_wheel"/>
+			</OnClick>
+		</Button>
+		<Button name="#helmetcam_wheel_action_a" origin="68 188" sizeX="96" sizeY="96" tooltip="Action cam: off. Click to switch the helmet cam to operators in combat automatically">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_action_a_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_action_a_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_action_a_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_wheel"/>
+			</OnClick>
+		</Button>
+		<Button name="#helmetcam_wheel_action_b" origin="68 188" sizeX="96" sizeY="96" hidden="true" tooltip="Action cam: on, the helmet cam switches to operators in combat. Click to turn it off">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_action_b_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_action_b_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_action_b_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_wheel"/>
+			</OnClick>
+		</Button>
+		<Button name="#helmetcam_wheel_nv_a" origin="173 100" sizeX="96" sizeY="96" tooltip="Night vision overlay: shown in the helmet cam. Click to remove it">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_nv_a_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_nv_a_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_nv_a_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_wheel"/>
+			</OnClick>
+		</Button>
+		<Button name="#helmetcam_wheel_nv_b" origin="173 100" sizeX="96" sizeY="96" hidden="true" tooltip="Night vision overlay: removed from the helmet cam. Click to show it">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_nv_b_normal.dds"/>
+			<OnHover>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_nv_b_hover.dds"/>
+			</OnHover>
+			<OnClick>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_nv_b_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<Action type="Callback" target="#helmetcam_wheel"/>
+			</OnClick>
+		</Button>
+	</Item>
+</GUIItems>

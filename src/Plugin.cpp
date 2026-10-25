@@ -209,7 +209,7 @@ struct Settings {
     bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
     bool hidePlans = true;       // the replay's "cinematic mode" for the helmet pass only: no paths, waypoints, highlights
     // Automatic switching of the cam's operator.
-    bool followSelection = false;          // switch to the operator the player selects (missions only)
+    int selectionMode = 0;                 // 0: a tap of the key switches to the operator the player selected; 1: the cam follows the selection at once (missions only)
     bool engageSwitch = false;             // switch to an operator who is engaging when the cam's one isn't
     bool engageOverridesSelection = false; // while the cam's operator is engaging, selection changes are ignored
     int cooldownMs = 800;                // after any switch, engagement switching waits this long (game time)
@@ -262,7 +262,10 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.colorName = ReadInt(file, L"color_name", s.colorName) != 0;
     s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
     s.hidePlans = ReadInt(file, L"hide_plans", s.hidePlans) != 0;
-    s.followSelection = ReadInt(file, L"follow_selection", s.followSelection) != 0;
+    if (ReadInt(file, L"follow_selection", 0) != 0) {
+        s.selectionMode = 1; // the old on/off setting: "on" is the instant mode
+    }
+    s.selectionMode = std::clamp(ReadInt(file, L"selection_mode", s.selectionMode), 0, 1);
     s.engageSwitch = ReadInt(file, L"engage_switch", s.engageSwitch) != 0;
     s.engageOverridesSelection = ReadInt(file, L"engage_overrides_selection", s.engageOverridesSelection) != 0;
     s.engageOnAim = ReadInt(file, L"engage_on_aim", s.engageOnAim) != 0;
@@ -311,7 +314,7 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"cooldown_ms", g_settings.cooldownMs);
     write(L"engage_hold_ms", g_settings.engageHoldMs);
     write(L"aim_settle_ms", g_settings.aimSettleMs);
-    write(L"follow_selection", g_settings.followSelection);
+    write(L"selection_mode", g_settings.selectionMode);
     write(L"engage_switch", g_settings.engageSwitch);
     write(L"engage_overrides_selection", g_settings.engageOverridesSelection);
     write(L"engage_on_aim", g_settings.engageOnAim);
@@ -460,9 +463,15 @@ void BuildOptions()
         o.onChange = SaveSettings;
         add(o);
     };
-    toggle("Follow the selected operator",
-           "The helmet cam switches to the operator you select. Tapping the key still cycles from there. Not used in replays",
-           &g_settings.followSelection);
+    static const char* const kSelectionModes[] = {"On key press", "Instantly"};
+    DK2ML_Option selection = {sizeof(DK2ML_Option), DK2ML_OPTION_CHOICE, "Selection switching",
+                              "On key press: tapping the key switches to the operator you selected, then keeps cycling. "
+                              "Instantly: the cam switches the moment you select someone (not in replays)"};
+    selection.value = &g_settings.selectionMode;
+    selection.choices = kSelectionModes;
+    selection.choiceCount = 2;
+    selection.onChange = SaveSettings;
+    add(selection);
     toggle("Switch to operators who are engaging",
            "If the cam's operator isn't engaging (aiming at an enemy they see, or shooting) but another operator is, the cam "
            "switches to them",
@@ -821,6 +830,10 @@ const float* HeadBone(void* human)
 bool g_open = false;
 uint32_t g_targetId = 0;       // Entity_Common::m_id of the operator we show; 0 = none yet
 bool g_cycleRequested = false;
+uint32_t g_lockedId = 0;        // the HUD lock button: the cam stays on this operator until unlocked (or they die)
+bool g_selectionPending = false; // the player selected someone the cam hasn't gone to: the next tap goes there
+
+uint32_t SelectedOperatorId();
 
 // --- automatic switching: game time (ms) so pauses and replay speed apply, per-operator engagement state by entity id ---
 constexpr int kNever = -100000000;
@@ -850,6 +863,8 @@ void ResetCam()
     g_open = false;
     g_targetId = 0;
     g_cycleRequested = false;
+    g_lockedId = 0;
+    g_selectionPending = false;
     g_lastSwitchMs = kNever;
     g_lastSelectedId = 0;
     g_lastEngaged.clear();
@@ -872,10 +887,45 @@ void* FindTarget(bool& alive)
         return nullptr;
     }
 
+    // Locked: the cam stays on that operator, taps do nothing. The lock ends when they die or leave the list.
+    if (g_lockedId != 0) {
+        void* locked = nullptr;
+        for (void* op : ops) {
+            if (Entity_id(op) == g_lockedId) {
+                locked = op;
+            }
+        }
+        if (locked && IsAlive(locked)) {
+            g_targetId = g_lockedId;
+            g_cycleRequested = false;
+        } else {
+            g_api->Log("helmet cam unlocked: operator %u is gone", g_lockedId);
+            g_lockedId = 0;
+        }
+    }
+
     int current = -1;
     for (size_t i = 0; i < ops.size(); ++i) {
         if (Entity_id(ops[i]) == g_targetId) {
             current = static_cast<int>(i);
+        }
+    }
+
+    // "On key press" selection switching: the first tap after the player selected someone goes to them, then taps cycle.
+    if (g_cycleRequested && g_selectionPending && g_settings.selectionMode == 0) {
+        g_selectionPending = false;
+        uint32_t selected = SelectedOperatorId();
+        for (size_t i = 0; selected != 0 && selected != g_targetId && i < ops.size(); ++i) {
+            if (Entity_id(ops[i]) == selected && IsAlive(ops[i])) {
+                current = static_cast<int>(i);
+                g_targetId = selected;
+                g_cycleRequested = false;
+                int now = 0;
+                if (GameNow(&now)) {
+                    g_lastSwitchMs = now;
+                }
+                g_api->Log("switch (selection, on key press): operator %u", g_targetId);
+            }
         }
     }
 
@@ -1042,16 +1092,53 @@ void SwitchTo(void* op, const char* reason, int now)
     g_api->Log("auto switch (%s): operator %u '%s'", reason, g_targetId, name ? name : "");
 }
 
+// The HUD lock button: lock the cam to the selected operator (the cam's current one when nobody is selected), or unlock.
+void ToggleLock()
+{
+    if (g_lockedId != 0) {
+        g_api->Log("helmet cam unlocked from operator %u", g_lockedId);
+        g_lockedId = 0;
+        return;
+    }
+    uint32_t id = SelectedOperatorId();
+    if (id == 0) {
+        id = g_targetId;
+    }
+    for (void* h : AllHumans()) {
+        if (IsOperator(h) && Entity_id(h) == id && IsAlive(h)) {
+            g_lockedId = id;
+            g_targetId = id;
+            g_selectionPending = false;
+            const char* name = Entity_name(h);
+            g_api->Log("helmet cam locked to operator %u '%s'", id, name ? name : "");
+            return;
+        }
+    }
+    g_api->Log("helmet cam lock: no living operator to lock to");
+}
+
 // Runs every frame in a mission. Selection changes switch at once (unless engagement overrides and the cam's operator is
 // engaging); engagement switches wait for the cooldown. Any switch starts the cooldown.
 void UpdateAutoTarget()
 {
     int now = 0;
-    if (!g_settings.enabled || (!g_settings.followSelection && !g_settings.engageSwitch) || !GameNow(&now)) {
+    if (!g_settings.enabled || !GameNow(&now)) {
         return;
     }
     if (now < g_lastSwitchMs) {
         g_lastSwitchMs = kNever; // a replay jumped back
+    }
+
+    // The selection is watched in both modes: instant mode switches on a change, on-key mode remembers it for the next tap.
+    uint32_t selected = dk2ml::IsReplaying(g_api) ? 0 : SelectedOperatorId();
+    bool selectionChanged = selected != g_lastSelectedId;
+    g_lastSelectedId = selected;
+    if (selectionChanged && selected != 0) {
+        g_selectionPending = true;
+    }
+
+    if (g_lockedId != 0 || (g_settings.selectionMode != 1 && !g_settings.engageSwitch)) {
+        return; // locked: nothing moves the cam
     }
 
     std::vector<void*> ops;
@@ -1073,15 +1160,12 @@ void UpdateAutoTarget()
         UpdateEngagement(ops, now);
     }
 
-    if (g_settings.followSelection && !dk2ml::IsReplaying(g_api)) {
-        uint32_t selected = SelectedOperatorId();
-        if (selected != g_lastSelectedId) {
-            g_lastSelectedId = selected;
-            void* op = selected != 0 && selected != g_targetId ? byId(selected) : nullptr;
-            bool held = g_settings.engageSwitch && g_settings.engageOverridesSelection && IsEngaging(g_targetId, now);
-            if (op && !held) {
-                SwitchTo(op, "selection", now);
-            }
+    if (g_settings.selectionMode == 1 && selectionChanged) {
+        void* op = selected != 0 && selected != g_targetId ? byId(selected) : nullptr;
+        bool held = g_settings.engageSwitch && g_settings.engageOverridesSelection && IsEngaging(g_targetId, now);
+        if (op && !held) {
+            g_selectionPending = false;
+            SwitchTo(op, "selection", now);
         }
     }
 
@@ -1858,6 +1942,156 @@ void DrawNameLabel()
     ImGui_End(); // always, whatever Begin returned
 }
 
+// --- the HUD widget: one Helmet Cam icon in the game's bottom HUD bar; clicking it fans out an arc of buttons ---
+// mod\gui\helmetcam_hud.xml (like Free Camera's wheel). There is one main icon per bar ("HUD" live, "HUD_Replay_Full" in
+// replays; an item has one parent), and one shared arc ("wheel") that moves into the icon in use while the arc is open (a
+// click on the icon opens it, another closes it). The arc holds four controls, each an item pair "_a"/"_b" (the state buttons): selection mode, lock,
+// action cam, night vision. Items are found after every GUI_LOADED and moved each time the HUD changes.
+dk2ml::Enum EVENT_CLICK{"GUI::Item::eItemEventType", "EVENT_CLICK"};
+
+enum HudControl { kHudSelect, kHudLock, kHudAction, kHudNightVision, kHudControls };
+
+struct HudWidget {
+    void* menu[2] = {};    // the main icon items: [0] live bar, [1] replay bar
+    void* menuOff[2] = {}; // their buttons: the cam is closed
+    void* menuOn[2] = {};  // the cam is open
+    void* wheel = nullptr;
+    void* buttonA[kHudControls] = {};
+    void* buttonB[kHudControls] = {};
+};
+HudWidget g_hud;
+bool g_arcOpen = false; // the main icon was clicked: the arc of buttons is out until it is clicked again
+
+bool HudState(int control) // true: the second ("_b") button
+{
+    switch (control) {
+    case kHudSelect: return g_settings.selectionMode == 1;
+    case kHudLock: return g_lockedId != 0;
+    case kHudAction: return g_settings.engageSwitch;
+    default: return g_settings.hideNightVision;
+    }
+}
+
+void OnMenuClick(void*, float, float, void*)
+{
+    g_arcOpen = !g_arcOpen;
+}
+
+void OnHudClick(void*, float, float, void* user)
+{
+    switch (static_cast<int>(reinterpret_cast<intptr_t>(user))) {
+    case kHudSelect: g_settings.selectionMode = g_settings.selectionMode == 1 ? 0 : 1; break;
+    case kHudLock: ToggleLock(); return;
+    case kHudAction: g_settings.engageSwitch = !g_settings.engageSwitch; break;
+    default: g_settings.hideNightVision = !g_settings.hideNightVision; break;
+    }
+    SaveSettings(nullptr, nullptr);
+}
+
+void OnGuiLoaded(const DK2ML_Event*, void*)
+{
+    g_hud = HudWidget{};
+    g_arcOpen = false;
+    int found = 0;
+    int bound = 0;
+
+    static const char* const kMenus[2] = {"#helmetcam_menu", "#helmetcam_menu_replay"};
+    for (int i = 0; i < 2; ++i) {
+        g_hud.menu[i] = dk2ml::gui::Find(g_api, kMenus[i]);
+        char name[64];
+        snprintf(name, sizeof(name), "%s_off", kMenus[i]);
+        g_hud.menuOff[i] = g_hud.menu[i] ? dk2ml::gui::Find(g_api, name, g_hud.menu[i]) : nullptr;
+        snprintf(name, sizeof(name), "%s_on", kMenus[i]);
+        g_hud.menuOn[i] = g_hud.menu[i] ? dk2ml::gui::Find(g_api, name, g_hud.menu[i]) : nullptr;
+        found += g_hud.menu[i] && g_hud.menuOff[i] && g_hud.menuOn[i];
+        bound += g_hud.menuOff[i] && dk2ml::gui::OnAction(g_api, g_hud.menuOff[i], EVENT_CLICK.Get(), OnMenuClick);
+        bound += g_hud.menuOn[i] && dk2ml::gui::OnAction(g_api, g_hud.menuOn[i], EVENT_CLICK.Get(), OnMenuClick);
+    }
+
+    g_hud.wheel = dk2ml::gui::Find(g_api, "#helmetcam_wheel");
+    static const char* const kNames[kHudControls] = {"select", "lock", "action", "nv"};
+    for (int i = 0; g_hud.wheel && i < kHudControls; ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "#helmetcam_wheel_%s_a", kNames[i]);
+        g_hud.buttonA[i] = dk2ml::gui::Find(g_api, name, g_hud.wheel);
+        snprintf(name, sizeof(name), "#helmetcam_wheel_%s_b", kNames[i]);
+        g_hud.buttonB[i] = dk2ml::gui::Find(g_api, name, g_hud.wheel);
+        void* user = reinterpret_cast<void*>(static_cast<intptr_t>(i));
+        for (void* button : {g_hud.buttonA[i], g_hud.buttonB[i]}) {
+            bound += button && dk2ml::gui::OnAction(g_api, button, EVENT_CLICK.Get(), OnHudClick, user);
+            found += button != nullptr;
+        }
+    }
+    g_api->Log("HUD widget: %d of %d items found (2 menu icons, 8 arc buttons), %d callbacks bound, arc %s", found, 2 + 8,
+               bound, g_hud.wheel ? "found" : "NOT found");
+}
+
+void UpdateHud()
+{
+    if (!g_hud.wheel) {
+        return;
+    }
+    bool replaying = dk2ml::IsReplaying(g_api);
+    int active = replaying ? 1 : 0;
+    void* bar = g_settings.enabled && InMission() ? dk2ml::gui::Find(g_api, replaying ? "HUD_Replay_Full" : "HUD") : nullptr;
+
+    // The icon of the bar in use is shown, the other one hidden (an item has one parent, so each bar has its own).
+    for (int i = 0; i < 2; ++i) {
+        void* menu = g_hud.menu[i];
+        if (!menu) {
+            continue;
+        }
+        bool here = bar && i == active;
+        if (here && dk2ml::gui::Parent(g_api, menu) != bar && dk2ml::gui::AddChild(g_api, bar, menu)) {
+            g_api->Log("HUD widget: menu icon placed in %s", replaying ? "HUD_Replay_Full" : "HUD");
+        }
+        if (dk2ml::gui::IsShown(g_api, menu) != here) {
+            dk2ml::gui::Show(g_api, menu, here);
+        }
+    }
+
+    void* menu = g_hud.menu[active];
+    if (!bar) {
+        g_arcOpen = false; // left the mission, or the mod is off
+    }
+    bool arc = bar && menu && g_arcOpen;
+    if (!arc) {
+        if (dk2ml::gui::IsShown(g_api, g_hud.wheel)) {
+            dk2ml::gui::Show(g_api, g_hud.wheel, false);
+        }
+    }
+    if (!bar || !menu) {
+        return;
+    }
+
+    // The main icon: amber while the cam is open.
+    if (g_hud.menuOff[active] && dk2ml::gui::IsShown(g_api, g_hud.menuOff[active]) == g_open) {
+        dk2ml::gui::Show(g_api, g_hud.menuOff[active], !g_open);
+    }
+    if (g_hud.menuOn[active] && dk2ml::gui::IsShown(g_api, g_hud.menuOn[active]) != g_open) {
+        dk2ml::gui::Show(g_api, g_hud.menuOn[active], g_open);
+    }
+
+    if (!arc) {
+        return;
+    }
+    if (dk2ml::gui::Parent(g_api, g_hud.wheel) != menu) {
+        dk2ml::gui::AddChild(g_api, menu, g_hud.wheel);
+    }
+    if (!dk2ml::gui::IsShown(g_api, g_hud.wheel)) {
+        dk2ml::gui::Show(g_api, g_hud.wheel);
+    }
+    for (int i = 0; i < kHudControls; ++i) {
+        bool b = HudState(i);
+        if (g_hud.buttonA[i] && dk2ml::gui::IsShown(g_api, g_hud.buttonA[i]) == b) {
+            dk2ml::gui::Show(g_api, g_hud.buttonA[i], !b);
+        }
+        if (g_hud.buttonB[i] && dk2ml::gui::IsShown(g_api, g_hud.buttonB[i]) != b) {
+            dk2ml::gui::Show(g_api, g_hud.buttonB[i], b);
+        }
+    }
+}
+
 void OnFrame(const DK2ML_Event*, void*)
 {
     if (g_settings.logOperators && InMission()) {
@@ -1869,6 +2103,7 @@ void OnFrame(const DK2ML_Event*, void*)
     }
     DrawSettingsWindow();
     DrawNameLabel();
+    UpdateHud();
 }
 
 void OnStateChanged(const DK2ML_Event* e, void*)
@@ -1925,7 +2160,7 @@ DK2ML_EXPORT int DK2ML_PluginInit(const DK2ML_API* api, const DK2ML_PluginInfo* 
     }
 
     if (!dk2ml::On(api, DK2ML_EVENT_FRAME, OnFrame) || !dk2ml::On(api, DK2ML_EVENT_STATE_CHANGED, OnStateChanged) ||
-        !dk2ml::On(api, DK2ML_EVENT_MAP_LOADED, OnMapLoaded)) {
+        !dk2ml::On(api, DK2ML_EVENT_MAP_LOADED, OnMapLoaded) || !dk2ml::On(api, DK2ML_EVENT_GUI_LOADED, OnGuiLoaded)) {
         return 3;
     }
     if (!dk2ml::Hook(api, RenderGame, RenderGamePre, RenderGamePost)) {
