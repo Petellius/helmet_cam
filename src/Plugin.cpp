@@ -196,8 +196,8 @@ struct Settings {
     bool enabled = true;
     int key = 0x48; // H (T is the game's troop-list key)
     int holdMs = 250;
-    float fov = 90.0f;           // degrees, the game's own free-fly camera uses 90
-    float offsetForward = 0.10f; // metres ahead of the entity, along the gaze
+    float fov = 45.0f;           // degrees (30-90)
+    float offsetForward = 0.15f; // metres ahead of the entity, along the gaze
     float offsetUp = 0.0f;       // metres added to the head height (1.58 standing, 1.14 crouched)
     int testPicture = 0;         // debug: 0 helmet view, 1 mirror of the main view, 2 solid color
     int anchor = 0;              // corner of the window the picture sits in: 0 top right, 1 top left, 2 bottom left, 3 bottom right
@@ -209,10 +209,10 @@ struct Settings {
     bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
     bool hidePlans = true;       // the replay's "cinematic mode" for the helmet pass only: no paths, waypoints, highlights
     // Automatic switching of the cam's operator.
-    int selectionMode = 0;                 // 0: a tap of the key switches to the operator the player selected; 1: the cam follows the selection at once (missions only)
+    int selectionMode = 1;                 // 0: a tap of the key switches to the operator the player selected; 1: the cam follows the selection at once (missions only)
     bool engageSwitch = false;             // switch to an operator who is engaging when the cam's one isn't
-    int cooldownMs = 800;                // after any switch, engagement switching waits this long (game time)
-    int engageHoldMs = 1000;              // the cam's operator stays "engaging" this long after their last shot or sighting
+    int cooldownMs = 650;                // after any switch, engagement switching waits this long (game time)
+    int engageHoldMs = 900;               // the cam's operator stays "engaging" this long after their last shot or sighting
     bool engageOnAim = true;               // aiming at an enemy the operator can see counts, not just shots
     int aimSettleMs = 400;                 // ...once the aim has been held on that enemy this long
     bool logOperators = false;
@@ -246,7 +246,7 @@ void ReadIni(const std::wstring& file, Settings& s)
     ReadFloat(file, L"fov", s.fov);
     ReadFloat(file, L"offset_forward", s.offsetForward);
     ReadFloat(file, L"offset_up", s.offsetUp);
-    s.fov = std::clamp(s.fov, 30.0f, 120.0f);
+    s.fov = std::clamp(s.fov, 30.0f, 90.0f);
     s.offsetForward = std::clamp(s.offsetForward, -0.5f, 1.0f);
     s.offsetUp = std::clamp(s.offsetUp, -0.5f, 0.5f);
     s.enabled = ReadInt(file, L"enabled", s.enabled) != 0;
@@ -382,8 +382,8 @@ void BuildOptions()
         o.onChange = SaveSettings;
         add(o);
     };
-    slider("Field of view", "How wide the helmet cam sees, in degrees; the game's own free camera uses 90",
-           &g_settings.fov, 30.0f, 120.0f, "%.0f deg");
+    slider("Field of view", "How wide the helmet cam sees, in degrees",
+           &g_settings.fov, 30.0f, 90.0f, "%.0f deg");
     slider("Forward offset", "Moves the camera ahead of the operator (negative: behind), in metres", &g_settings.offsetForward,
            -0.5f, 1.0f, "%.2f m");
     slider("Height offset", "Raises or lowers the camera from the head height (1.58 m standing, 1.14 m crouched)",
