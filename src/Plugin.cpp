@@ -157,6 +157,11 @@ dk2ml::Fn<void(void* renderer, const void* view, void* out, void* matrix)> GetSh
 // The game's options (loaded from options.xml): `<DisableCameraPan/>` is this flag.
 dk2ml::Global<uint8_t> Options_game{"Options::game"};
 dk2ml::Field<bool> OptionsGame_disableEndGameCameraPan{"Options::sGame", "disableEndGameCameraPan"};
+// The game's "Colored plans" option (0 No, 1 Individual, 2 Class) and the colour it gives each operator's path:
+// Human_Client::GetColor() returns the table colour (data/gameplay_settings/team_colors.xml) as 0xAABBGGRR, white when
+// plans aren't coloured.
+dk2ml::Field<int> OptionsGame_coloredPlans{"Options::sGame", "coloredPlans"};
+dk2ml::Fn<uint32_t(const void* human)> Human_GetColor{"Human_Client::GetColor"};
 
 // OpenGL: the game loads the framebuffer entry points itself, so use its pointers (opengl32 only exports GL 1.1).
 using PFN_GenFramebuffers = void(APIENTRY*)(GLsizei, GLuint*);
@@ -195,6 +200,7 @@ struct Settings {
     float offsetUp = 0.0f;       // metres added to the head height (1.58 standing, 1.14 crouched)
     int testPicture = 0;         // debug: 0 helmet view, 1 mirror of the main view, 2 solid color
     bool showName = true;        // the operator's name at the top left of the helmet picture
+    bool colorName = true;       // ...on a chip in the colour of the operator's path, while Colored plans is on
     bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
     bool hidePlans = true;       // the replay's "cinematic mode" for the helmet pass only: no paths, waypoints, highlights
     // Automatic switching of the cam's operator.
@@ -246,6 +252,7 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.holdMs = std::clamp(ReadInt(file, L"hold_ms", s.holdMs), 100, 1000);
     s.testPicture = std::clamp(ReadInt(file, L"test_picture", s.testPicture), 0, 2);
     s.showName = ReadInt(file, L"show_name", s.showName) != 0;
+    s.colorName = ReadInt(file, L"color_name", s.colorName) != 0;
     s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
     s.hidePlans = ReadInt(file, L"hide_plans", s.hidePlans) != 0;
     s.followSelection = ReadInt(file, L"follow_selection", s.followSelection) != 0;
@@ -288,6 +295,7 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"hold_ms", g_settings.holdMs);
     write(L"test_picture", g_settings.testPicture);
     write(L"show_name", g_settings.showName);
+    write(L"color_name", g_settings.colorName);
     write(L"fow_off", g_settings.fowOff);
     write(L"hide_plans", g_settings.hidePlans);
     write(L"cooldown_ms", g_settings.cooldownMs);
@@ -385,6 +393,13 @@ void BuildOptions()
                              &g_settings.showName};
     showName.onChange = SaveSettings;
     add(showName);
+
+    DK2ML_Option colorName = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Colour the name like the operator's path",
+                              "While the game's Colored plans option is on, the name's background takes the colour of "
+                              "that operator's path. With Colored plans set to No it stays plain",
+                              &g_settings.colorName};
+    colorName.onChange = SaveSettings;
+    add(colorName);
 
     DK2ML_Option fow = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Fog of war off in the helmet view",
                         "Shows the floor everywhere in the helmet picture. Only the picture changes; the game still hides "
@@ -490,6 +505,10 @@ struct ImVec2 {
     float x, y;
 };
 
+struct ImVec4 {
+    float x, y, z, w;
+};
+
 dk2ml::Fn<bool(const char* name, bool* open, int flags)> ImGui_Begin{"ImGui::Begin"};
 dk2ml::Fn<void()> ImGui_End{"ImGui::End"};
 dk2ml::Fn<bool(const char* label, bool* value)> ImGui_Checkbox{"ImGui::Checkbox"};
@@ -499,6 +518,11 @@ dk2ml::Fn<bool(const char* label, int dataType, void* data, const void* min, con
 dk2ml::Fn<bool(const char* label, const ImVec2* size, int flags)> ImGui_ButtonEx{"ImGui::ButtonEx"};
 dk2ml::Fn<void(const char* text, const char* textEnd, int flags)> ImGui_TextEx{"ImGui::TextEx"};
 dk2ml::Fn<void(const char* fmt, ...)> ImGui_TextWrapped{"ImGui::TextWrapped"};
+dk2ml::Fn<void(const ImVec4* color, const char* fmt, ...)> ImGui_TextColored{"ImGui::TextColored"};
+// The style colours are plain floats inside the context: the name chip's background is set there for the Begin call only.
+dk2ml::Field<uint8_t> ImGuiContext_Style{"ImGuiContext", "Style"};
+dk2ml::Field<uint8_t> ImGuiStyle_Colors{"ImGuiStyle", "Colors"};
+dk2ml::Enum ImGuiCol_WindowBg{"ImGuiCol_", "ImGuiCol_WindowBg"};
 dk2ml::Fn<void(float offsetFromStartX, float spacing)> ImGui_SameLine{"ImGui::SameLine"};
 dk2ml::Fn<void()> ImGui_Spacing{"ImGui::Spacing"};
 dk2ml::Fn<void(int flags)> ImGui_SeparatorEx{"ImGui::SeparatorEx"};
@@ -514,6 +538,13 @@ dk2ml::Enum ImGuiWindowFlags_NoFocusOnAppearing{"ImGuiWindowFlags_", "ImGuiWindo
 dk2ml::Enum ImGuiWindowFlags_NoNav{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoNav"};
 dk2ml::Enum ImGuiCond_Always{"ImGuiCond_", "ImGuiCond_Always"};
 dk2ml::Field<void*> ImGuiContext_CurrentWindow{"ImGuiContext", "CurrentWindow"};
+// SetWindowFontScale is inlined away: it only stores the window's scale and refreshes the two cached font sizes, so
+// the name label does the same by hand (ImGui::End re-derives them for the window underneath).
+dk2ml::Field<float> ImGuiWindow_FontWindowScale{"ImGuiWindow", "FontWindowScale"};
+dk2ml::Field<float> ImGuiContext_FontSize{"ImGuiContext", "FontSize"};
+dk2ml::Field<float> ImGuiContext_FontBaseSize{"ImGuiContext", "FontBaseSize"};
+dk2ml::Field<uint8_t> ImGuiContext_DrawListSharedData{"ImGuiContext", "DrawListSharedData"};
+dk2ml::Field<float> ImDrawListSharedData_FontSize{"ImDrawListSharedData", "FontSize"};
 dk2ml::Fn<void(void* window, const ImVec2* pos, int cond)> ImGui_SetWindowPos{
     "?SetWindowPos@ImGui@@YAXPEAUImGuiWindow@@AEBUImVec2@@H@Z"};
 dk2ml::Enum ImGuiDataType_Float{"ImGuiDataType_", "ImGuiDataType_Float"};
@@ -1743,18 +1774,69 @@ void DrawNameLabel()
     }
 
     std::string label = OperatorLabel(human);
+
+    // With the game's Colored plans on (Individual or Class), the chip takes the colour of the operator's path. The game
+    // itself says which colour that is (GetColor, 0xAABBGGRR). The text is black or white, whichever reads better on it.
+    uint8_t* game = Options_game.Address();
+    int coloredPlans = game ? OptionsGame_coloredPlans(game) : 0;
+    bool tint = g_settings.colorName && coloredPlans != 0;
+    ImVec4 chip = {};
+    ImVec4 textColor = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (tint) {
+        uint32_t argb = Human_GetColor(human);
+        // The game packs it as 0xAABBGGRR (red in the low byte): the logged values match the operators' ring colours.
+        chip = {static_cast<float>(argb & 0xFF) / 255.0f, static_cast<float>((argb >> 8) & 0xFF) / 255.0f,
+                static_cast<float>((argb >> 16) & 0xFF) / 255.0f, 0.92f};
+        float luminance = 0.299f * chip.x + 0.587f * chip.y + 0.114f * chip.z;
+        textColor = luminance > 0.6f ? ImVec4{0.0f, 0.0f, 0.0f, 1.0f} : ImVec4{1.0f, 1.0f, 1.0f, 1.0f};
+
+        static uint32_t s_loggedId = 0;
+        if (s_loggedId != g_targetId) {
+            s_loggedId = g_targetId;
+            g_api->Log("name chip colour 0x%08X (coloured plans mode %d) for operator %u '%s'", argb, coloredPlans,
+                       g_targetId, label.c_str());
+        }
+    }
+
     int flags = static_cast<int>(ImGuiWindowFlags_NoDecoration.Get() | ImGuiWindowFlags_AlwaysAutoResize.Get() |
                                  ImGuiWindowFlags_NoSavedSettings.Get() | ImGuiWindowFlags_NoMouseInputs.Get() |
                                  ImGuiWindowFlags_NoFocusOnAppearing.Get() | ImGuiWindowFlags_NoNav.Get());
-    if (ImGui_Begin("##helmetcam_name", nullptr, flags)) {
-        void* context = GImGui ? *GImGui : nullptr;
+    void* context = GImGui ? *GImGui : nullptr;
+    // The window background is read inside Begin: set the style colour just for that call, then put it back so no other
+    // ImGui window changes.
+    ImVec4* background = nullptr;
+    ImVec4 savedBackground = {};
+    if (tint && context) {
+        background = reinterpret_cast<ImVec4*>(static_cast<char*>(context) + ImGuiContext_Style.Offset() +
+                                               ImGuiStyle_Colors.Offset()) +
+                     ImGuiCol_WindowBg.Get();
+        savedBackground = *background;
+        *background = chip;
+    }
+    bool begun = ImGui_Begin("##helmetcam_name", nullptr, flags);
+    if (background) {
+        *background = savedBackground;
+    }
+    if (begun) {
         void* window = context ? dk2ml::At<void*>(context, ImGuiContext_CurrentWindow.Offset()) : nullptr;
         if (window) {
             PipRect rect = ComputePipRect(g_frame.viewW, g_frame.viewH);
             ImVec2 pos = {static_cast<float>(rect.x + 8), static_cast<float>(rect.yTop + 8)};
             ImGui_SetWindowPos(window, &pos, static_cast<int>(ImGuiCond_Always.Get()));
+
+            // Twice the default text size for this window only.
+            constexpr float kNameScale = 2.0f;
+            dk2ml::At<float>(window, ImGuiWindow_FontWindowScale.Offset()) = kNameScale;
+            float size = dk2ml::At<float>(context, ImGuiContext_FontBaseSize.Offset()) * kNameScale;
+            dk2ml::At<float>(context, ImGuiContext_FontSize.Offset()) = size;
+            dk2ml::At<float>(context, ImGuiContext_DrawListSharedData.Offset() + ImDrawListSharedData_FontSize.Offset()) =
+                size;
         }
-        ImGui_TextEx(label.c_str(), nullptr, 0);
+        if (tint) {
+            ImGui_TextColored(&textColor, "%s", label.c_str());
+        } else {
+            ImGui_TextEx(label.c_str(), nullptr, 0);
+        }
     }
     ImGui_End(); // always, whatever Begin returned
 }
