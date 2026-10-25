@@ -211,9 +211,8 @@ struct Settings {
     // Automatic switching of the cam's operator.
     int selectionMode = 0;                 // 0: a tap of the key switches to the operator the player selected; 1: the cam follows the selection at once (missions only)
     bool engageSwitch = false;             // switch to an operator who is engaging when the cam's one isn't
-    bool engageOverridesSelection = false; // while the cam's operator is engaging, selection changes are ignored
     int cooldownMs = 800;                // after any switch, engagement switching waits this long (game time)
-    int engageHoldMs = 1000;              // an operator stays "engaging" this long after the last shot or sighting
+    int engageHoldMs = 1000;              // the cam's operator stays "engaging" this long after their last shot or sighting
     bool engageOnAim = true;               // aiming at an enemy the operator can see counts, not just shots
     int aimSettleMs = 400;                 // ...once the aim has been held on that enemy this long
     bool logOperators = false;
@@ -267,7 +266,6 @@ void ReadIni(const std::wstring& file, Settings& s)
     }
     s.selectionMode = std::clamp(ReadInt(file, L"selection_mode", s.selectionMode), 0, 1);
     s.engageSwitch = ReadInt(file, L"engage_switch", s.engageSwitch) != 0;
-    s.engageOverridesSelection = ReadInt(file, L"engage_overrides_selection", s.engageOverridesSelection) != 0;
     s.engageOnAim = ReadInt(file, L"engage_on_aim", s.engageOnAim) != 0;
     s.cooldownMs = std::clamp(ReadInt(file, L"cooldown_ms", s.cooldownMs), 100, 4000);
     s.engageHoldMs = std::clamp(ReadInt(file, L"engage_hold_ms", s.engageHoldMs), 100, 4000);
@@ -316,7 +314,6 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"aim_settle_ms", g_settings.aimSettleMs);
     write(L"selection_mode", g_settings.selectionMode);
     write(L"engage_switch", g_settings.engageSwitch);
-    write(L"engage_overrides_selection", g_settings.engageOverridesSelection);
     write(L"engage_on_aim", g_settings.engageOnAim);
     write(L"log_operators", g_settings.logOperators);
     write(L"allow_all_humans", g_settings.allowAllHumans);
@@ -476,18 +473,14 @@ void BuildOptions()
            "If the cam's operator isn't engaging (aiming at an enemy they see, or shooting) but another operator is, the cam "
            "switches to them",
            &g_settings.engageSwitch);
-    autoSlider("Switch cooldown", "After any switch, engagement switching waits this long before it switches again",
+    autoSlider("Switch cooldown", "After an action cam switch, the action cam waits this long before it switches again. Selection and key switching ignore it",
                &g_settings.cooldownMs, 100, 4000);
-    toggle("Engagement overrides selection",
-           "While the cam's operator is engaging, selecting a different operator doesn't switch the cam. Off: selecting "
-           "always switches",
-           &g_settings.engageOverridesSelection);
     toggle("Count aiming at a seen enemy",
            "Engaging starts when an operator aims at an enemy they can see, before the first shot. Off: shots only",
            &g_settings.engageOnAim);
     autoSlider("Aim held for", "How long an operator must keep aiming at an enemy they see before it counts; sweeping past "
                "one doesn't", &g_settings.aimSettleMs, 0, 1000);
-    autoSlider("Stay engaged after", "How long an operator counts as engaging after their last shot or sighting",
+    autoSlider("Stay engaged after", "How long the cam stays on its operator after their last shot or sighting. Other operators only count while they are shooting or aiming",
                &g_settings.engageHoldMs, 100, 4000);
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Debug"});
@@ -837,7 +830,7 @@ uint32_t SelectedOperatorId();
 
 // --- automatic switching: game time (ms) so pauses and replay speed apply, per-operator engagement state by entity id ---
 constexpr int kNever = -100000000;
-int g_lastSwitchMs = kNever;               // the last switch of any kind (manual tap, selection, engagement)
+int g_lastSwitchMs = kNever;               // the last action cam (engagement) switch; the cooldown measures from it
 uint32_t g_lastSelectedId = 0;             // the operator selected last frame, to see a selection change
 std::unordered_map<uint32_t, int> g_lastEngaged;   // last shot or settled aim, per operator
 std::unordered_map<uint32_t, int> g_engageStart;   // when the current run of engagement began, per operator
@@ -920,10 +913,6 @@ void* FindTarget(bool& alive)
                 current = static_cast<int>(i);
                 g_targetId = selected;
                 g_cycleRequested = false;
-                int now = 0;
-                if (GameNow(&now)) {
-                    g_lastSwitchMs = now;
-                }
                 g_api->Log("switch (selection, on key press): operator %u", g_targetId);
             }
         }
@@ -932,7 +921,6 @@ void* FindTarget(bool& alive)
     if (g_cycleRequested || current < 0) {
         // Next living operator after the current one (the first one when there is none): dead operators are skipped.
         // No living operator leaves the target alone, so a dead target stays on a black cam.
-        bool manual = g_cycleRequested;
         g_cycleRequested = false;
         int n = static_cast<int>(ops.size());
         for (int k = 1; k <= n; ++k) {
@@ -940,10 +928,6 @@ void* FindTarget(bool& alive)
             if (IsAlive(ops[candidate])) {
                 current = candidate;
                 g_targetId = Entity_id(ops[candidate]);
-                int now = 0;
-                if (manual && GameNow(&now)) {
-                    g_lastSwitchMs = now; // a manual switch starts the cooldown too, so the cam isn't pulled away at once
-                }
                 break;
             }
         }
@@ -1036,8 +1020,12 @@ bool AimSettled(void* human, const std::vector<void*>& humans, int now)
     return now - found->second.since >= g_settings.aimSettleMs;
 }
 
-// Engaging: a shot or settled aim within engageHoldMs. A replay that jumped back leaves a "future" time: forget it.
-bool IsEngaging(uint32_t id, int now)
+// Engaging: a shot or settled aim within windowMs. The cam's own operator is held for engageHoldMs after their last one,
+// so the cam stays on them while the fight winds down; every other operator only counts while they are shooting or aiming
+// right now (kActiveMs). A replay that jumped back leaves a "future" time: forget it.
+constexpr int kActiveMs = 300; // longer than the 100 ms aim check, so a held aim stays "active"
+
+bool IsEngaging(uint32_t id, int now, int windowMs)
 {
     auto found = g_lastEngaged.find(id);
     if (found == g_lastEngaged.end()) {
@@ -1048,7 +1036,7 @@ bool IsEngaging(uint32_t id, int now)
         g_lastEngaged.erase(found);
         return false;
     }
-    return age < g_settings.engageHoldMs;
+    return age < windowMs;
 }
 
 // Aim checks (the costly part: a sight line per operator and enemy) run at about 10 Hz and only while the cam is open.
@@ -1069,7 +1057,7 @@ void UpdateEngagement(const std::vector<void*>& ops, int now)
     }
     for (void* op : ops) {
         uint32_t id = Entity_id(op);
-        if (IsAlive(op) && IsEngaging(id, now)) {
+        if (IsAlive(op) && IsEngaging(id, now, kActiveMs)) {
             g_engageStart.emplace(id, now); // keeps the first time of an ongoing run
         } else {
             g_engageStart.erase(id);
@@ -1087,7 +1075,9 @@ uint32_t SelectedOperatorId()
 void SwitchTo(void* op, const char* reason, int now)
 {
     g_targetId = Entity_id(op);
-    g_lastSwitchMs = now;
+    if (strcmp(reason, "engagement") == 0) {
+        g_lastSwitchMs = now; // only action cam switches start the action cam's cooldown
+    }
     const char* name = Entity_name(op);
     g_api->Log("auto switch (%s): operator %u '%s'", reason, g_targetId, name ? name : "");
 }
@@ -1117,8 +1107,8 @@ void ToggleLock()
     g_api->Log("helmet cam lock: no living operator to lock to");
 }
 
-// Runs every frame in a mission. Selection changes switch at once (unless engagement overrides and the cam's operator is
-// engaging); engagement switches wait for the cooldown. Any switch starts the cooldown.
+// Runs every frame in a mission. Selection changes switch at once (instant mode); engagement (action cam) switches wait
+// for the cooldown, which only they start.
 void UpdateAutoTarget()
 {
     int now = 0;
@@ -1162,8 +1152,7 @@ void UpdateAutoTarget()
 
     if (g_settings.selectionMode == 1 && selectionChanged) {
         void* op = selected != 0 && selected != g_targetId ? byId(selected) : nullptr;
-        bool held = g_settings.engageSwitch && g_settings.engageOverridesSelection && IsEngaging(g_targetId, now);
-        if (op && !held) {
+        if (op) {
             g_selectionPending = false;
             SwitchTo(op, "selection", now);
         }
@@ -1174,7 +1163,7 @@ void UpdateAutoTarget()
         bool currentDead = current && !IsAlive(current);
         bool cooledDown = now - g_lastSwitchMs >= g_settings.cooldownMs;
         // A dead operator's black cam shouldn't wait: someone else is fighting.
-        if ((cooledDown || currentDead) && !(current && IsAlive(current) && IsEngaging(g_targetId, now))) {
+        if ((cooledDown || currentDead) && !(current && IsAlive(current) && IsEngaging(g_targetId, now, g_settings.engageHoldMs))) {
             void* best = nullptr;
             int bestStart = 0;
             for (void* op : ops) {
