@@ -1168,10 +1168,13 @@ DK2ML_EXPORT int DK2ML_PluginInit(const DK2ML_API* api, const DK2ML_PluginInfo* 
         return 5;
     }
 
-    // The Esc menu's "CAM" button opens the settings window: a label instead of an icon, so there's no art to ship.
+    // The Esc menu's button opens the settings window. It borrows the game's own night-vision goggles icon (a head-worn
+    // device, drawn in the same round badge as the other buttons), so there's no art to ship. If a game update moves
+    // these textures, set `label = "CAM"` instead.
     DK2ML_MenuButton button = {sizeof(button)};
     button.tooltip = "Helmet Cam settings";
-    button.label = "CAM";
+    button.icon = "data/textures/hud/toggle_nvg_off_normal.dds";
+    button.iconHover = "data/textures/hud/toggle_nvg_off_hover.dds";
     button.onClick = OnSettingsButton;
     if (!dk2ml::gui::AddMenuButton(api, button)) {
         api->Log("no Esc-menu button (the settings are still on the Modloader page)");
