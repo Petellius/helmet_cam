@@ -129,6 +129,8 @@ dk2ml::Fn<void(void* renderer)> GameRenderer_ToggleFOW{"GameRenderer::ToggleFOW"
 // render object whose template says hideInCinematicMode (charge and door highlights among them).
 dk2ml::Field<uint8_t> GameRenderer_renderOptions{"GameRenderer", "m_renderOptions"};
 dk2ml::Field<bool> RenderOptions_plans{"GameRenderer::sRenderOptions", "plans"};
+// The night-vision look the renderer applies on night maps (sRenderOptions +80, next to colorCorrection).
+dk2ml::Field<bool> RenderOptions_nvg{"GameRenderer::sRenderOptions", "nvg"};
 
 // The red doors: an entity that an order will open, kick or destroy gets the game's "red ghost" look. The game does it in
 // Entity_Client::SetRedGhostEffect(entity, on) by rewriting each of the entity's render objects: alpha blending (blend
@@ -154,9 +156,8 @@ dk2ml::Field<float> sRenderObjectData_diffuseColor{"sRenderObjectData", "diffuse
 dk2ml::Fn<void(void* renderer, const void* view, void* out, void* matrix)> GetShadowMapCameraParams{
     "GameRenderer::GetShadowMapCameraParams"};
 
-// The game's options (loaded from options.xml): `<DisableCameraPan/>` is this flag.
+// The game's options (loaded from options.xml).
 dk2ml::Global<uint8_t> Options_game{"Options::game"};
-dk2ml::Field<bool> OptionsGame_disableEndGameCameraPan{"Options::sGame", "disableEndGameCameraPan"};
 // The game's "Colored plans" option (0 No, 1 Individual, 2 Class) and the colour it gives each operator's path:
 // Human_Client::GetColor() returns the table colour (data/gameplay_settings/team_colors.xml) as 0xAABBGGRR, white when
 // plans aren't coloured.
@@ -203,7 +204,7 @@ struct Settings {
     int offsetX = 16;            // pixels in from that corner
     int offsetY = 16;
     int sizePercent = 25;        // picture width as a percentage of the window width
-    bool showName = true;        // the operator's name at the top left of the helmet picture
+    bool hideNightVision = false; // no night-vision overlay in the helmet picture
     bool colorName = true;       // ...on a chip in the colour of the operator's path, while Colored plans is on
     bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
     bool hidePlans = true;       // the replay's "cinematic mode" for the helmet pass only: no paths, waypoints, highlights
@@ -216,9 +217,7 @@ struct Settings {
     bool engageOnAim = true;               // aiming at an enemy the operator can see counts, not just shots
     int aimSettleMs = 400;                 // ...once the aim has been held on that enemy this long
     bool logOperators = false;
-    bool anyHuman = false;       // debug: every human counts as an operator
-    bool panManaged = false;     // the player changed the end-of-mission pan option, so the mod sets it
-    bool disableEndCameraPan = false;
+    bool allowAllHumans = false; // enemies, civilians and hostages count as operators too (their own helmet cams)
 };
 
 Settings g_defaults;
@@ -259,7 +258,7 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.offsetX = std::clamp(ReadInt(file, L"offset_x", s.offsetX), 0, 400);
     s.offsetY = std::clamp(ReadInt(file, L"offset_y", s.offsetY), 0, 400);
     s.sizePercent = std::clamp(ReadInt(file, L"size_percent", s.sizePercent), 10, 60);
-    s.showName = ReadInt(file, L"show_name", s.showName) != 0;
+    s.hideNightVision = ReadInt(file, L"hide_night_vision", s.hideNightVision) != 0;
     s.colorName = ReadInt(file, L"color_name", s.colorName) != 0;
     s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
     s.hidePlans = ReadInt(file, L"hide_plans", s.hidePlans) != 0;
@@ -271,10 +270,9 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.engageHoldMs = std::clamp(ReadInt(file, L"engage_hold_ms", s.engageHoldMs), 100, 4000);
     s.aimSettleMs = std::clamp(ReadInt(file, L"aim_settle_ms", s.aimSettleMs), 0, 1000);
     s.logOperators = ReadInt(file, L"log_operators", s.logOperators) != 0;
-    s.anyHuman = ReadInt(file, L"any_human", s.anyHuman) != 0;
-    int pan = ReadInt(file, L"disable_end_camera_pan", s.panManaged ? (s.disableEndCameraPan ? 1 : 0) : -1);
-    s.panManaged = pan >= 0;
-    s.disableEndCameraPan = pan > 0;
+    // "any_human" is the old name of this setting; settings.ini files from before the rename keep working.
+    s.allowAllHumans = ReadInt(file, L"any_human", s.allowAllHumans) != 0;
+    s.allowAllHumans = ReadInt(file, L"allow_all_humans", s.allowAllHumans) != 0;
 }
 
 void SaveSettings(const DK2ML_Option*, void*)
@@ -306,7 +304,7 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"offset_x", g_settings.offsetX);
     write(L"offset_y", g_settings.offsetY);
     write(L"size_percent", g_settings.sizePercent);
-    write(L"show_name", g_settings.showName);
+    write(L"hide_night_vision", g_settings.hideNightVision);
     write(L"color_name", g_settings.colorName);
     write(L"fow_off", g_settings.fowOff);
     write(L"hide_plans", g_settings.hidePlans);
@@ -318,8 +316,7 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"engage_overrides_selection", g_settings.engageOverridesSelection);
     write(L"engage_on_aim", g_settings.engageOnAim);
     write(L"log_operators", g_settings.logOperators);
-    write(L"any_human", g_settings.anyHuman);
-    write(L"disable_end_camera_pan", g_settings.panManaged ? (g_settings.disableEndCameraPan ? 1 : 0) : -1);
+    write(L"allow_all_humans", g_settings.allowAllHumans);
 }
 
 void LoadSettings(const DK2ML_PluginInfo* info)
@@ -343,12 +340,6 @@ void LoadSettings(const DK2ML_PluginInfo* info)
     }
 }
 
-void OnPanChanged(const DK2ML_Option*, void*)
-{
-    g_settings.panManaged = true; // from now on the mod sets the game's flag
-    SaveSettings(nullptr, nullptr);
-}
-
 void OnReset(const DK2ML_Option*, void*)
 {
     g_settings = g_defaults;
@@ -367,6 +358,11 @@ void BuildOptions()
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER,
          "Helmet Cam - WARNING: renders the scene a second time while open, expect a lower frame rate"});
 
+    DK2ML_Option reset = {sizeof(DK2ML_Option), DK2ML_OPTION_BUTTON, "Reset to defaults",
+                          "Restores every setting to the value this mod shipped with"};
+    reset.onChange = OnReset;
+    add(reset);
+
     DK2ML_Option enabled = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Enable Helmet Cam",
                             "Master switch. Off: the key does nothing and nothing extra is rendered",
                             &g_settings.enabled};
@@ -378,12 +374,6 @@ void BuildOptions()
                         &g_settings.key};
     key.onChange = SaveSettings;
     add(key);
-
-    DK2ML_Option hold = {sizeof(DK2ML_Option), DK2ML_OPTION_INT, "Hold time",
-                         "How long the key is held to open or close the helmet cam; a shorter press is a tap",
-                         &g_settings.holdMs, 100.0f, 1000.0f, "%d ms"};
-    hold.onChange = SaveSettings;
-    add(hold);
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Camera"});
 
@@ -398,6 +388,12 @@ void BuildOptions()
            -0.5f, 1.0f, "%.2f m");
     slider("Height offset", "Raises or lowers the camera from the head height (1.58 m standing, 1.14 m crouched)",
            &g_settings.offsetUp, -0.5f, 0.5f, "%.2f m");
+
+    DK2ML_Option any = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Allow enemy and civilian helmet cams",
+                        "The cam can also cycle to enemies, civilians and hostages, not only the operators you control",
+                        &g_settings.allowAllHumans};
+    any.onChange = SaveSettings;
+    add(any);
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Picture"});
 
@@ -423,13 +419,6 @@ void BuildOptions()
     pixels("Picture size", "Width of the helmet picture as a percentage of the window width", &g_settings.sizePercent,
            10, 60, "%d %%");
 
-    DK2ML_Option showName = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Show the operator's name",
-                             "Writes the name of the operator the cam is on at the top left of the helmet picture. If they "
-                             "have no name, their unit or class name is shown",
-                             &g_settings.showName};
-    showName.onChange = SaveSettings;
-    add(showName);
-
     DK2ML_Option colorName = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Colour the name like the operator's path",
                               "While the game's Colored plans option is on, the name's background takes the colour of "
                               "that operator's path. With Colored plans set to No it stays plain",
@@ -450,6 +439,13 @@ void BuildOptions()
                           &g_settings.hidePlans};
     plans.onChange = SaveSettings;
     add(plans);
+
+    DK2ML_Option nvg = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Remove night vision overlay in the helmet view",
+                        "On night maps the helmet picture is drawn without the night-vision effect. The scene may look "
+                        "darker. The main view is unaffected",
+                        &g_settings.hideNightVision};
+    nvg.onChange = SaveSettings;
+    add(nvg);
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Automatic switching"});
 
@@ -485,14 +481,6 @@ void BuildOptions()
     autoSlider("Stay engaged after", "How long an operator counts as engaging after their last shot or sighting",
                &g_settings.engageHoldMs, 100, 4000);
 
-    add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Game"});
-
-    DK2ML_Option pan = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Disable end-of-mission camera pan",
-                        "Skips the camera pulling out at the end of a mission or replay (the game's DisableCameraPan)",
-                        &g_settings.disableEndCameraPan};
-    pan.onChange = OnPanChanged;
-    add(pan);
-
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Debug"});
 
     static const char* const kTestPictures[] = {"Off (helmet view)", "Mirror the main view", "Solid color"};
@@ -510,16 +498,6 @@ void BuildOptions()
                         &g_settings.logOperators};
     log.onChange = SaveSettings;
     add(log);
-
-    DK2ML_Option any = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Any human counts as an operator",
-                        "For testing: cycle through every human, not just the ones you control", &g_settings.anyHuman};
-    any.onChange = SaveSettings;
-    add(any);
-
-    DK2ML_Option reset = {sizeof(DK2ML_Option), DK2ML_OPTION_BUTTON, "Reset to defaults",
-                          "Restores the values this mod shipped with"};
-    reset.onChange = OnReset;
-    add(reset);
 }
 
 bool AddOptions()
@@ -809,7 +787,7 @@ std::vector<void*> AllHumans()
 
 bool IsOperator(void* human)
 {
-    return g_settings.anyHuman || Human_isControlable(human);
+    return g_settings.allowAllHumans || Human_isControlable(human);
 }
 
 bool IsAlive(void* human)
@@ -1521,6 +1499,8 @@ struct PassOverrides {
     bool toggledFow = false;
     bool changedPlans = false;
     bool plansBefore = false;
+    bool changedNvg = false;
+    bool nvgBefore = false;
     std::vector<void*> redDoors; // doors that were red and are plain for the helmet pass
 
     void Apply(void* r)
@@ -1549,6 +1529,12 @@ struct PassOverrides {
                 }
             }
         }
+        if (g_settings.hideNightVision) {
+            bool& nvg = RenderOptions_nvg(static_cast<uint8_t*>(r) + GameRenderer_renderOptions.Offset());
+            nvgBefore = nvg;
+            changedNvg = true;
+            nvg = false; // restored in Restore, so the main view keeps its night vision
+        }
         if (g_settings.fowOff) {
             GameRenderer_ToggleFOW(r); // fog of war off (flag: disabled)
             toggledFow = true;
@@ -1559,6 +1545,9 @@ struct PassOverrides {
     {
         if (changedPlans) {
             RenderOptions_plans(static_cast<uint8_t*>(renderer) + GameRenderer_renderOptions.Offset()) = plansBefore;
+        }
+        if (changedNvg) {
+            RenderOptions_nvg(static_cast<uint8_t*>(renderer) + GameRenderer_renderOptions.Offset()) = nvgBefore;
         }
         for (void* door : redDoors) {
             Entity_SetRedGhostEffect(door, true); // red again for the game's own frame
@@ -1646,9 +1635,9 @@ int RenderGamePre(DK2ML_Regs* regs, void*)
                        g_lastFixedEye.y, g_lastFixedEye.z, g_lastBoneOk ? "ok" : "unusable", g_lastBoneEye.x,
                        g_lastBoneEye.y, g_lastBoneEye.z, g_lastBoneOk ? "the bone" : "the fixed height");
             g_api->Log("  fog of war off in the helmet view: %d, hide plans: %d (game's plans flag was %d, now restored), "
-                       "red doors made plain for this pass: %d",
+                       "red doors made plain for this pass: %d, night vision removed: %d (game's flag was %d, now restored)",
                        g_settings.fowOff, g_settings.hidePlans, overrides.plansBefore,
-                       static_cast<int>(overrides.redDoors.size()));
+                       static_cast<int>(overrides.redDoors.size()), g_settings.hideNightVision, overrides.nvgBefore);
             g_api->Log("  our view: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", mv[0], mv[1],
                        mv[2], mv[3], mv[4], mv[5], mv[6], mv[7], mv[8], mv[9], mv[10], mv[11]);
             if (gv) {
@@ -1722,21 +1711,6 @@ void HandleKey()
     g_keyWasDown = down;
 }
 
-// The game loads options.xml after the plugin's init, so the flag is read and written from frames on.
-void ApplyEndCameraPan()
-{
-    uint8_t* game = Options_game.Address();
-    if (!game) {
-        return;
-    }
-    bool& flag = OptionsGame_disableEndGameCameraPan(game);
-    if (!g_settings.panManaged) {
-        g_settings.disableEndCameraPan = flag; // show the game's own setting until the player picks one
-        return;
-    }
-    flag = g_settings.disableEndCameraPan;
-}
-
 ULONGLONG g_lastLog = 0;
 
 void LogOperators()
@@ -1807,7 +1781,7 @@ void* TargetHuman()
 // (the same space as the picture). Its default background keeps the text readable on any scene.
 void DrawNameLabel()
 {
-    if (!g_settings.showName || !g_settings.enabled || !g_open || !g_fbo || g_frame.viewW <= 0 || !InMission() ||
+    if (!g_settings.enabled || !g_open || !g_fbo || g_frame.viewW <= 0 || !InMission() ||
         dk2ml::GameMenuOpen(g_api)) {
         return;
     }
@@ -1886,7 +1860,6 @@ void DrawNameLabel()
 
 void OnFrame(const DK2ML_Event*, void*)
 {
-    ApplyEndCameraPan();
     if (g_settings.logOperators && InMission()) {
         LogOperators();
     }
