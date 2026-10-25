@@ -199,6 +199,10 @@ struct Settings {
     float offsetForward = 0.10f; // metres ahead of the entity, along the gaze
     float offsetUp = 0.0f;       // metres added to the head height (1.58 standing, 1.14 crouched)
     int testPicture = 0;         // debug: 0 helmet view, 1 mirror of the main view, 2 solid color
+    int anchor = 0;              // corner of the window the picture sits in: 0 top right, 1 top left, 2 bottom left, 3 bottom right
+    int offsetX = 16;            // pixels in from that corner
+    int offsetY = 16;
+    int sizePercent = 25;        // picture width as a percentage of the window width
     bool showName = true;        // the operator's name at the top left of the helmet picture
     bool colorName = true;       // ...on a chip in the colour of the operator's path, while Colored plans is on
     bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
@@ -251,6 +255,10 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.key = ReadInt(file, L"key", s.key);
     s.holdMs = std::clamp(ReadInt(file, L"hold_ms", s.holdMs), 100, 1000);
     s.testPicture = std::clamp(ReadInt(file, L"test_picture", s.testPicture), 0, 2);
+    s.anchor = std::clamp(ReadInt(file, L"anchor", s.anchor), 0, 3);
+    s.offsetX = std::clamp(ReadInt(file, L"offset_x", s.offsetX), 0, 400);
+    s.offsetY = std::clamp(ReadInt(file, L"offset_y", s.offsetY), 0, 400);
+    s.sizePercent = std::clamp(ReadInt(file, L"size_percent", s.sizePercent), 10, 60);
     s.showName = ReadInt(file, L"show_name", s.showName) != 0;
     s.colorName = ReadInt(file, L"color_name", s.colorName) != 0;
     s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
@@ -294,6 +302,10 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"key", g_settings.key);
     write(L"hold_ms", g_settings.holdMs);
     write(L"test_picture", g_settings.testPicture);
+    write(L"anchor", g_settings.anchor);
+    write(L"offset_x", g_settings.offsetX);
+    write(L"offset_y", g_settings.offsetY);
+    write(L"size_percent", g_settings.sizePercent);
     write(L"show_name", g_settings.showName);
     write(L"color_name", g_settings.colorName);
     write(L"fow_off", g_settings.fowOff);
@@ -386,6 +398,30 @@ void BuildOptions()
            -0.5f, 1.0f, "%.2f m");
     slider("Height offset", "Raises or lowers the camera from the head height (1.58 m standing, 1.14 m crouched)",
            &g_settings.offsetUp, -0.5f, 0.5f, "%.2f m");
+
+    add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Picture"});
+
+    static const char* const kAnchors[] = {"Top right", "Top left", "Bottom left", "Bottom right"};
+    DK2ML_Option anchor = {sizeof(DK2ML_Option), DK2ML_OPTION_CHOICE, "Anchor",
+                           "Which corner of the screen the helmet picture sits in"};
+    anchor.value = &g_settings.anchor;
+    anchor.choices = kAnchors;
+    anchor.choiceCount = 4;
+    anchor.onChange = SaveSettings;
+    add(anchor);
+
+    auto pixels = [&](const char* label, const char* tip, int* value, int lo, int hi, const char* fmt) {
+        DK2ML_Option o = {sizeof(DK2ML_Option), DK2ML_OPTION_INT, label, tip, value, static_cast<float>(lo),
+                          static_cast<float>(hi), fmt};
+        o.onChange = SaveSettings;
+        add(o);
+    };
+    pixels("Offset from the side", "Distance from the anchor corner's left or right edge of the screen, in pixels",
+           &g_settings.offsetX, 0, 400, "%d px");
+    pixels("Offset from the top or bottom", "Distance from the anchor corner's top or bottom edge of the screen, in pixels",
+           &g_settings.offsetY, 0, 400, "%d px");
+    pixels("Picture size", "Width of the helmet picture as a percentage of the window width", &g_settings.sizePercent,
+           10, 60, "%d %%");
 
     DK2ML_Option showName = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Show the operator's name",
                              "Writes the name of the operator the cam is on at the top left of the helmet picture. If they "
@@ -1166,18 +1202,25 @@ void DestroyResources()
 }
 
 // Where the helmet picture sits, in window pixels measured from the top left: a quarter of the window wide, the window's
-// aspect, in the top right corner. The picture and the name label both use this, so a different anchor, size or quality
-// only has to change it here.
+// aspect, placed by the anchor, offsets and size settings. The picture, its texture and the name label all use this.
 struct PipRect {
-    int x, yTop, w, h;
+    int x, yTop, w, h; // where the picture is shown, and how big (the texture has the same size)
 };
 
 PipRect ComputePipRect(int viewW, int viewH)
 {
-    constexpr int kMargin = 16;
-    int w = std::max(64, viewW / 4);
-    int h = std::max(36, static_cast<int>(static_cast<int64_t>(w) * viewH / std::max(viewW, 1)));
-    return {viewW - kMargin - w, kMargin, w, h};
+    int w = std::clamp(viewW * g_settings.sizePercent / 100, 64, std::max(64, viewW));
+    int h = std::clamp(static_cast<int>(static_cast<int64_t>(w) * viewH / std::max(viewW, 1)), 36, std::max(36, viewH));
+
+    // Offsets measure in from the anchor corner; the clamp keeps the whole picture inside the window.
+    bool right = g_settings.anchor == 0 || g_settings.anchor == 3;
+    bool bottom = g_settings.anchor == 2 || g_settings.anchor == 3;
+    int x = right ? viewW - g_settings.offsetX - w : g_settings.offsetX;
+    int y = bottom ? viewH - g_settings.offsetY - h : g_settings.offsetY;
+    x = std::clamp(x, 0, std::max(0, viewW - w));
+    y = std::clamp(y, 0, std::max(0, viewH - h));
+
+    return {x, y, w, h};
 }
 
 bool EnsureResources(int viewW, int viewH)
@@ -1330,9 +1373,9 @@ void BlitToCorner(int viewW, int viewH)
 {
     PipRect rect = ComputePipRect(viewW, viewH);
     int x0 = rect.x;
-    int x1 = rect.x + g_texW;
+    int x1 = rect.x + rect.w;
     int y1 = viewH - rect.yTop; // GL's origin is the bottom left
-    int y0 = y1 - g_texH;
+    int y0 = y1 - rect.h;
 
     GlSaved saved;
     SaveGl(saved);
