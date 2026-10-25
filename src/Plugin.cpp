@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "dk2ml.hpp"
@@ -83,6 +84,32 @@ dk2ml::Field<Vec3> Entity_left{"Entity_Common", "m_left"};
 dk2ml::Field<Vec3> Entity_up{"Entity_Common", "m_up"};
 dk2ml::Field<Vec3> Entity_forward{"Entity_Common", "m_forward"};
 dk2ml::Field<float> Entity_scale{"Entity_Common", "m_scale"};
+
+// Automatic switching. The engagement detection follows era's Lights and Lasers (MIT,
+// github.com/gabrweu/doorkickers-visible-lasers, src/lasers/Engagement.cpp): the client has no "target", so an operator
+// is engaging on each shot (EV_HUMAN_FIREARM_SHOT, one per round, also in replays) and, optionally, after aiming at an
+// enemy it can see for a moment; it stays engaged for a while after the last shot or sighting.
+dk2ml::Global<void*> g_pGameInput{"g_pGameInput"};
+dk2ml::Fn<void*(const void* input)> GameInput_GetSelectedHuman{"GameInput::GetSelectedHuman"};
+dk2ml::Field<int> GameCommon_gameTime{"GameCommon", "m_gameTime"}; // ms; stops while paused, slows with slow-mo
+dk2ml::Field<void*> Entity_pTemplate{"Entity_Common", "m_pTemplate"};
+dk2ml::Field<int> HumanTemplate_type{"Human_Template", "type"};    // eHumanType
+dk2ml::Field<Vec3> Human_aimDirection{"Human_Client", "m_aimDirection"};
+dk2ml::Field<bool> Human_isSurrendered{"Human_Client", "m_isSurrendered"};
+dk2ml::Field<int> Human_currentCommand{"Human_Client", "m_currentCommand"}; // eHumanCommand
+dk2ml::Field<bool> Entity_hiddenInFow{"Entity_Client", "m_bHiddenInFOW"};
+dk2ml::Enum HUMAN_GOODGUY{"eHumanType", "HUMAN_GOODGUY"};
+dk2ml::Enum HUMAN_BADGUY{"eHumanType", "HUMAN_BADGUY"};
+dk2ml::Enum EV_HUMAN_FIREARM_SHOT{"Entity_Common::eEntityEvent", "EV_HUMAN_FIREARM_SHOT"};
+dk2ml::Enum HUMAN_CMD_SHOTGUN_DOOR{"eHumanCommand", "HUMAN_CMD_SHOTGUN_DOOR"};
+dk2ml::Enum COL_VISION_BLOCK{"eCollisionFlags", "COL_VISION_BLOCK"};
+// bool GameCommon::HasLineOfSight(const Vector3& eye, const Vector3& dir, float coneDeg, const Entity_Common* target,
+//                                 unsigned blockFlags, bool)  (static)
+dk2ml::Fn<bool(const Vec3* eye, const Vec3* dir, float coneDeg, const void* target, uint32_t blockFlags, bool flag)>
+    GameCommon_HasLineOfSight{"?HasLineOfSight@GameCommon@@SA_NAEBVVector3@@0MPEBVEntity_Common@@I_N@Z"};
+// void Human_Client::Net_ReceiveEvent(eNetworkMask, eEntityEvent, unsigned size, const BitPacker&): argument 2 is the event
+dk2ml::Fn<void(void* human, int mask, int event, unsigned size, const void* packer)> Human_Net_ReceiveEvent{
+    "?Net_ReceiveEvent@Human_Client@@UEAAXW4eNetworkMask@@W4eEntityEvent@Entity_Common@@IAEBVBitPacker@@@Z"};
 
 // ToggleFOW flips the game's global "fog of war disabled" flag (the game's own free-fly FPS camera calls it when it
 // starts and stops), so it is called once before the nested pass and once after.
@@ -159,6 +186,14 @@ struct Settings {
     int testPicture = 0;         // debug: 0 helmet view, 1 mirror of the main view, 2 solid color
     bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
     bool hidePlans = true;       // the replay's "cinematic mode" for the helmet pass only: no paths, waypoints, highlights
+    // Automatic switching of the cam's operator.
+    bool followSelection = false;          // switch to the operator the player selects (missions only)
+    bool engageSwitch = false;             // switch to an operator who is engaging when the cam's one isn't
+    bool engageOverridesSelection = false; // while the cam's operator is engaging, selection changes are ignored
+    int cooldownMs = 800;                // after any switch, engagement switching waits this long (game time)
+    int engageHoldMs = 1000;              // an operator stays "engaging" this long after the last shot or sighting
+    bool engageOnAim = true;               // aiming at an enemy the operator can see counts, not just shots
+    int aimSettleMs = 400;                 // ...once the aim has been held on that enemy this long
     bool logOperators = false;
     bool anyHuman = false;       // debug: every human counts as an operator
     bool panManaged = false;     // the player changed the end-of-mission pan option, so the mod sets it
@@ -201,6 +236,13 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.testPicture = std::clamp(ReadInt(file, L"test_picture", s.testPicture), 0, 2);
     s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
     s.hidePlans = ReadInt(file, L"hide_plans", s.hidePlans) != 0;
+    s.followSelection = ReadInt(file, L"follow_selection", s.followSelection) != 0;
+    s.engageSwitch = ReadInt(file, L"engage_switch", s.engageSwitch) != 0;
+    s.engageOverridesSelection = ReadInt(file, L"engage_overrides_selection", s.engageOverridesSelection) != 0;
+    s.engageOnAim = ReadInt(file, L"engage_on_aim", s.engageOnAim) != 0;
+    s.cooldownMs = std::clamp(ReadInt(file, L"cooldown_ms", s.cooldownMs), 100, 4000);
+    s.engageHoldMs = std::clamp(ReadInt(file, L"engage_hold_ms", s.engageHoldMs), 100, 4000);
+    s.aimSettleMs = std::clamp(ReadInt(file, L"aim_settle_ms", s.aimSettleMs), 0, 1000);
     s.logOperators = ReadInt(file, L"log_operators", s.logOperators) != 0;
     s.anyHuman = ReadInt(file, L"any_human", s.anyHuman) != 0;
     int pan = ReadInt(file, L"disable_end_camera_pan", s.panManaged ? (s.disableEndCameraPan ? 1 : 0) : -1);
@@ -235,6 +277,13 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"test_picture", g_settings.testPicture);
     write(L"fow_off", g_settings.fowOff);
     write(L"hide_plans", g_settings.hidePlans);
+    write(L"cooldown_ms", g_settings.cooldownMs);
+    write(L"engage_hold_ms", g_settings.engageHoldMs);
+    write(L"aim_settle_ms", g_settings.aimSettleMs);
+    write(L"follow_selection", g_settings.followSelection);
+    write(L"engage_switch", g_settings.engageSwitch);
+    write(L"engage_overrides_selection", g_settings.engageOverridesSelection);
+    write(L"engage_on_aim", g_settings.engageOnAim);
     write(L"log_operators", g_settings.logOperators);
     write(L"any_human", g_settings.anyHuman);
     write(L"disable_end_camera_pan", g_settings.panManaged ? (g_settings.disableEndCameraPan ? 1 : 0) : -1);
@@ -330,6 +379,40 @@ void BuildOptions()
                           &g_settings.hidePlans};
     plans.onChange = SaveSettings;
     add(plans);
+
+    add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Automatic switching"});
+
+    auto toggle = [&](const char* label, const char* tip, bool* value) {
+        DK2ML_Option o = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, label, tip, value};
+        o.onChange = SaveSettings;
+        add(o);
+    };
+    auto autoSlider = [&](const char* label, const char* tip, int* value, int lo, int hi) {
+        DK2ML_Option o = {sizeof(DK2ML_Option), DK2ML_OPTION_INT, label, tip, value, static_cast<float>(lo),
+                          static_cast<float>(hi), "%d ms"};
+        o.onChange = SaveSettings;
+        add(o);
+    };
+    toggle("Follow the selected operator",
+           "The helmet cam switches to the operator you select. Tapping the key still cycles from there. Not used in replays",
+           &g_settings.followSelection);
+    toggle("Switch to operators who are engaging",
+           "If the cam's operator isn't engaging (aiming at an enemy they see, or shooting) but another operator is, the cam "
+           "switches to them",
+           &g_settings.engageSwitch);
+    autoSlider("Switch cooldown", "After any switch, engagement switching waits this long before it switches again",
+               &g_settings.cooldownMs, 100, 4000);
+    toggle("Engagement overrides selection",
+           "While the cam's operator is engaging, selecting a different operator doesn't switch the cam. Off: selecting "
+           "always switches",
+           &g_settings.engageOverridesSelection);
+    toggle("Count aiming at a seen enemy",
+           "Engaging starts when an operator aims at an enemy they can see, before the first shot. Off: shots only",
+           &g_settings.engageOnAim);
+    autoSlider("Aim held for", "How long an operator must keep aiming at an enemy they see before it counts; sweeping past "
+               "one doesn't", &g_settings.aimSettleMs, 0, 1000);
+    autoSlider("Stay engaged after", "How long an operator counts as engaging after their last shot or sighting",
+               &g_settings.engageHoldMs, 100, 4000);
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Game"});
 
@@ -663,11 +746,39 @@ bool g_open = false;
 uint32_t g_targetId = 0;       // Entity_Common::m_id of the operator we show; 0 = none yet
 bool g_cycleRequested = false;
 
+// --- automatic switching: game time (ms) so pauses and replay speed apply, per-operator engagement state by entity id ---
+constexpr int kNever = -100000000;
+int g_lastSwitchMs = kNever;               // the last switch of any kind (manual tap, selection, engagement)
+uint32_t g_lastSelectedId = 0;             // the operator selected last frame, to see a selection change
+std::unordered_map<uint32_t, int> g_lastEngaged;   // last shot or settled aim, per operator
+std::unordered_map<uint32_t, int> g_engageStart;   // when the current run of engagement began, per operator
+struct AimState {
+    uint32_t enemy;
+    int since;
+};
+std::unordered_map<uint32_t, AimState> g_aims;
+ULONGLONG g_lastEngageTick = 0;            // real time of the last aim check (they run at about 10 Hz)
+
+bool GameNow(int* now)
+{
+    void* client = g_pGameClient ? *g_pGameClient : nullptr;
+    if (!client) {
+        return false;
+    }
+    *now = GameCommon_gameTime(client);
+    return true;
+}
+
 void ResetCam()
 {
     g_open = false;
     g_targetId = 0;
     g_cycleRequested = false;
+    g_lastSwitchMs = kNever;
+    g_lastSelectedId = 0;
+    g_lastEngaged.clear();
+    g_engageStart.clear();
+    g_aims.clear();
 }
 
 // The operator to show, or null. `alive` is false when the cam should be black: that operator died (the cam stays
@@ -695,6 +806,7 @@ void* FindTarget(bool& alive)
     if (g_cycleRequested || current < 0) {
         // Next living operator after the current one (the first one when there is none): dead operators are skipped.
         // No living operator leaves the target alone, so a dead target stays on a black cam.
+        bool manual = g_cycleRequested;
         g_cycleRequested = false;
         int n = static_cast<int>(ops.size());
         for (int k = 1; k <= n; ++k) {
@@ -702,6 +814,10 @@ void* FindTarget(bool& alive)
             if (IsAlive(ops[candidate])) {
                 current = candidate;
                 g_targetId = Entity_id(ops[candidate]);
+                int now = 0;
+                if (manual && GameNow(&now)) {
+                    g_lastSwitchMs = now; // a manual switch starts the cooldown too, so the cam isn't pulled away at once
+                }
                 break;
             }
         }
@@ -712,6 +828,211 @@ void* FindTarget(bool& alive)
     }
     alive = IsAlive(ops[current]);
     return ops[current];
+}
+
+// --- automatic switching: who is engaging, and the rules for switching ---
+constexpr float kAimRangeM = 25.0f;
+constexpr float kAimConeDeg = 10.0f; // either side of the aim
+constexpr float kEyeHeightM = 1.8f;  // as the game's own sight checks
+
+bool IsHumanType(void* human, const dk2ml::Enum& type)
+{
+    void* tmpl = Entity_pTemplate(human);
+    return tmpl && HumanTemplate_type(tmpl) == static_cast<int>(type.Get());
+}
+
+// A shot by one of our side. One event per round; door breaching shots don't count.
+int ReceiveEventPre(DK2ML_Regs* regs, void*)
+{
+    if (!g_settings.engageSwitch || dk2ml::Arg<int>(regs, 2) != static_cast<int>(EV_HUMAN_FIREARM_SHOT.Get())) {
+        return DK2ML_CALL_ORIGINAL;
+    }
+    void* human = dk2ml::Arg<void*>(regs, 0);
+    int now = 0;
+    if (human && IsHumanType(human, HUMAN_GOODGUY) && IsAlive(human) &&
+        Human_currentCommand(human) != static_cast<int>(HUMAN_CMD_SHOTGUN_DOOR.Get()) && GameNow(&now)) {
+        g_lastEngaged[Entity_id(human)] = now;
+    }
+    return DK2ML_CALL_ORIGINAL;
+}
+
+// The nearest live enemy near the operator's level aim that the team sees (m_bHiddenInFOW) and the operator has a line of
+// sight to. 0 if none.
+uint32_t AimedEnemy(void* human, const std::vector<void*>& humans)
+{
+    Vec3 aim = Human_aimDirection(human);
+    float aimLength = std::sqrt(aim.x * aim.x + aim.z * aim.z);
+    if (aimLength < 1e-4f) {
+        return 0;
+    }
+
+    Vec3 from = Entity_origin(human);
+    Vec3 eye = {from.x, kEyeHeightM, from.z};
+    Vec3 level = {aim.x / aimLength, 0.0f, aim.z / aimLength};
+    float minCos = std::cos(kAimConeDeg * 3.14159265f / 180.0f);
+    uint32_t visionBlock = static_cast<uint32_t>(COL_VISION_BLOCK.Get());
+    uint32_t nearest = 0;
+    float nearestDistance = kAimRangeM;
+    for (void* enemy : humans) {
+        if (!IsHumanType(enemy, HUMAN_BADGUY) || !IsAlive(enemy) || Human_isSurrendered(enemy) ||
+            Entity_hiddenInFow(enemy)) {
+            continue;
+        }
+        Vec3 to = Entity_origin(enemy);
+        float dx = to.x - from.x;
+        float dz = to.z - from.z;
+        float distance = std::sqrt(dx * dx + dz * dz);
+        if (distance < 1e-3f || distance > nearestDistance || (dx * level.x + dz * level.z) / distance < minCos) {
+            continue;
+        }
+        if (GameCommon_HasLineOfSight(&eye, &level, 2.0f * kAimConeDeg, enemy, visionBlock, false)) {
+            nearest = Entity_id(enemy);
+            nearestDistance = distance;
+        }
+    }
+    return nearest;
+}
+
+// True once the operator has kept aiming at the same seen enemy for aimSettleMs.
+bool AimSettled(void* human, const std::vector<void*>& humans, int now)
+{
+    uint32_t id = Entity_id(human);
+    uint32_t enemy = AimedEnemy(human, humans);
+    if (enemy == 0) {
+        g_aims.erase(id);
+        return false;
+    }
+    auto found = g_aims.find(id);
+    if (found == g_aims.end() || found->second.enemy != enemy || now < found->second.since) {
+        g_aims[id] = {enemy, now};
+        return g_settings.aimSettleMs <= 0;
+    }
+    return now - found->second.since >= g_settings.aimSettleMs;
+}
+
+// Engaging: a shot or settled aim within engageHoldMs. A replay that jumped back leaves a "future" time: forget it.
+bool IsEngaging(uint32_t id, int now)
+{
+    auto found = g_lastEngaged.find(id);
+    if (found == g_lastEngaged.end()) {
+        return false;
+    }
+    int age = now - found->second;
+    if (age < 0) {
+        g_lastEngaged.erase(found);
+        return false;
+    }
+    return age < g_settings.engageHoldMs;
+}
+
+// Aim checks (the costly part: a sight line per operator and enemy) run at about 10 Hz and only while the cam is open.
+// This also notes when each operator's current run of engagement began, to pick the one engaging longest.
+void UpdateEngagement(const std::vector<void*>& ops, int now)
+{
+    ULONGLONG tick = GetTickCount64();
+    if (tick - g_lastEngageTick >= 100) {
+        g_lastEngageTick = tick;
+        if (g_settings.engageOnAim) {
+            std::vector<void*> humans = AllHumans();
+            for (void* op : ops) {
+                if (IsAlive(op) && AimSettled(op, humans, now)) {
+                    g_lastEngaged[Entity_id(op)] = now;
+                }
+            }
+        }
+    }
+    for (void* op : ops) {
+        uint32_t id = Entity_id(op);
+        if (IsAlive(op) && IsEngaging(id, now)) {
+            g_engageStart.emplace(id, now); // keeps the first time of an ongoing run
+        } else {
+            g_engageStart.erase(id);
+        }
+    }
+}
+
+uint32_t SelectedOperatorId()
+{
+    void* input = g_pGameInput ? *g_pGameInput : nullptr;
+    void* human = input ? GameInput_GetSelectedHuman(input) : nullptr;
+    return human && IsOperator(human) && IsAlive(human) ? Entity_id(human) : 0;
+}
+
+void SwitchTo(void* op, const char* reason, int now)
+{
+    g_targetId = Entity_id(op);
+    g_lastSwitchMs = now;
+    const char* name = Entity_name(op);
+    g_api->Log("auto switch (%s): operator %u '%s'", reason, g_targetId, name ? name : "");
+}
+
+// Runs every frame in a mission. Selection changes switch at once (unless engagement overrides and the cam's operator is
+// engaging); engagement switches wait for the cooldown. Any switch starts the cooldown.
+void UpdateAutoTarget()
+{
+    int now = 0;
+    if (!g_settings.enabled || (!g_settings.followSelection && !g_settings.engageSwitch) || !GameNow(&now)) {
+        return;
+    }
+    if (now < g_lastSwitchMs) {
+        g_lastSwitchMs = kNever; // a replay jumped back
+    }
+
+    std::vector<void*> ops;
+    for (void* h : AllHumans()) {
+        if (IsOperator(h)) {
+            ops.push_back(h);
+        }
+    }
+    auto byId = [&](uint32_t id) -> void* {
+        for (void* op : ops) {
+            if (Entity_id(op) == id) {
+                return op;
+            }
+        }
+        return nullptr;
+    };
+
+    if (g_settings.engageSwitch && g_open) {
+        UpdateEngagement(ops, now);
+    }
+
+    if (g_settings.followSelection && !dk2ml::IsReplaying(g_api)) {
+        uint32_t selected = SelectedOperatorId();
+        if (selected != g_lastSelectedId) {
+            g_lastSelectedId = selected;
+            void* op = selected != 0 && selected != g_targetId ? byId(selected) : nullptr;
+            bool held = g_settings.engageSwitch && g_settings.engageOverridesSelection && IsEngaging(g_targetId, now);
+            if (op && !held) {
+                SwitchTo(op, "selection", now);
+            }
+        }
+    }
+
+    if (g_settings.engageSwitch && g_open) {
+        void* current = byId(g_targetId);
+        bool currentDead = current && !IsAlive(current);
+        bool cooledDown = now - g_lastSwitchMs >= g_settings.cooldownMs;
+        // A dead operator's black cam shouldn't wait: someone else is fighting.
+        if ((cooledDown || currentDead) && !(current && IsAlive(current) && IsEngaging(g_targetId, now))) {
+            void* best = nullptr;
+            int bestStart = 0;
+            for (void* op : ops) {
+                uint32_t id = Entity_id(op);
+                auto start = g_engageStart.find(id);
+                if (id == g_targetId || !IsAlive(op) || start == g_engageStart.end()) {
+                    continue;
+                }
+                if (!best || start->second < bestStart) { // the one engaging longest; ties keep roster order
+                    best = op;
+                    bestStart = start->second;
+                }
+            }
+            if (best) {
+                SwitchTo(best, "engagement", now);
+            }
+        }
+    }
 }
 
 // --- GL resources: a texture the size of the corner picture, and a framebuffer around it ---
@@ -1332,6 +1653,9 @@ void OnFrame(const DK2ML_Event*, void*)
         LogOperators();
     }
     HandleKey();
+    if (InMission()) {
+        UpdateAutoTarget();
+    }
     DrawSettingsWindow();
 }
 
@@ -1397,6 +1721,9 @@ DK2ML_EXPORT int DK2ML_PluginInit(const DK2ML_API* api, const DK2ML_PluginInfo* 
     }
     if (!dk2ml::Hook(api, GetShadowMapCameraParams, ShadowParamsPre)) {
         return 6;
+    }
+    if (!dk2ml::Hook(api, Human_Net_ReceiveEvent, ReceiveEventPre)) { // a no-op unless engagement switching is on
+        return 7;
     }
 
     api->Log("ready (spike): hold vk=0x%X for %d ms to open or close the cam, tap to cycle", g_settings.key,
