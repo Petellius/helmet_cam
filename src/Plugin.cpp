@@ -15,6 +15,7 @@
 #include <GL/gl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -205,6 +206,7 @@ struct Settings {
     int offsetY = 16;
     int sizePercent = 25;        // picture width as a percentage of the window width
     bool hideNightVision = false; // no night-vision overlay in the helmet picture
+    int refreshRate = 2;         // how often the helmet view is re-rendered: 0 every frame, 1 60, 2 30, 3 15 fps
     bool colorName = true;       // ...on a chip in the colour of the operator's path, while Colored plans is on
     bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
     bool hidePlans = true;       // the replay's "cinematic mode" for the helmet pass only: no paths, waypoints, highlights
@@ -258,6 +260,7 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.offsetY = std::clamp(ReadInt(file, L"offset_y", s.offsetY), 0, 400);
     s.sizePercent = std::clamp(ReadInt(file, L"size_percent", s.sizePercent), 10, 60);
     s.hideNightVision = ReadInt(file, L"hide_night_vision", s.hideNightVision) != 0;
+    s.refreshRate = std::clamp(ReadInt(file, L"refresh_rate", s.refreshRate), 0, 3);
     s.colorName = ReadInt(file, L"color_name", s.colorName) != 0;
     s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
     s.hidePlans = ReadInt(file, L"hide_plans", s.hidePlans) != 0;
@@ -306,6 +309,7 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"offset_y", g_settings.offsetY);
     write(L"size_percent", g_settings.sizePercent);
     write(L"hide_night_vision", g_settings.hideNightVision);
+    write(L"refresh_rate", g_settings.refreshRate);
     write(L"color_name", g_settings.colorName);
     write(L"fow_off", g_settings.fowOff);
     write(L"hide_plans", g_settings.hidePlans);
@@ -446,6 +450,19 @@ void BuildOptions()
                         &g_settings.hideNightVision};
     nvg.onChange = SaveSettings;
     add(nvg);
+
+    add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Performance"});
+
+    static const char* const kRefreshRates[] = {"Every frame", "60 fps", "30 fps", "15 fps"};
+    DK2ML_Option refresh = {sizeof(DK2ML_Option), DK2ML_OPTION_CHOICE, "Helmet view refresh rate",
+                            "How often the helmet view is drawn. The second scene render is the cost of this mod: a lower rate "
+                            "gives you back frame rate, and a small corner picture looks fine at 30 fps. The picture isn't "
+                            "redrawn at all while the window is unfocused or a menu is open"};
+    refresh.value = &g_settings.refreshRate;
+    refresh.choices = kRefreshRates;
+    refresh.choiceCount = 4;
+    refresh.onChange = SaveSettings;
+    add(refresh);
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Automatic switching"});
 
@@ -822,6 +839,22 @@ const float* HeadBone(void* human)
 // --- the cam: which operator, open or closed ---
 bool g_open = false;
 uint32_t g_targetId = 0;       // Entity_Common::m_id of the operator we show; 0 = none yet
+
+// --- the cost cap: the helmet view is re-rendered at most this often, and not at all while nobody can see it ---
+bool g_forcePass = true;                    // draw the next helmet view whatever the cap says (just opened, new texture)
+std::chrono::steady_clock::time_point g_lastPass;
+int g_lastPassGameMs = -1;                  // game time of the last helmet view: unchanged means the game is paused
+uint32_t g_lastPassTarget = 0;              // the operator the last helmet view showed
+int g_passesDone = 0;
+int g_passesSkipped = 0;
+
+void LogPassStats(const char* why)
+{
+    static const int kRates[] = {0, 60, 30, 15};
+    int fps = kRates[std::clamp(g_settings.refreshRate, 0, 3)];
+    g_api->Log("helmet cam closed (%s): %d views drawn, %d skipped (refresh rate %s)", why, g_passesDone, g_passesSkipped,
+               fps ? std::to_string(fps).append(" fps").c_str() : "every frame");
+}
 bool g_cycleRequested = false;
 uint32_t g_lockedId = 0;        // the HUD lock button: the cam stays on this operator until unlocked (or they die)
 bool g_selectionPending = false; // the player selected someone the cam hasn't gone to: the next tap goes there
@@ -1311,6 +1344,7 @@ bool EnsureResources(int viewW, int viewH)
     g_texW = w;
     g_texH = h;
     g_texFill = -1;
+    g_forcePass = true; // the new texture is blank
     g_api->Log("helmet cam: %dx%d picture for a %dx%d window", w, h, viewW, viewH);
     return true;
 }
@@ -1647,6 +1681,27 @@ struct FrameInfo {
     int viewW = 0, viewH = 0;
 } g_frame;
 
+// Is a new helmet view due? The expensive part (the nested scene render) runs only when it is: at the refresh rate, at once
+// for a new operator or texture, never while the window is unfocused or a game menu is open, and only twice a second while
+// the game is paused (its time stands still), so a changed setting still shows up. In between, the last picture is reused.
+bool PassDue(uint32_t targetId)
+{
+    if (g_forcePass || targetId != g_lastPassTarget) {
+        return true;
+    }
+    if (!g_api->IsGameFocused() || dk2ml::GameMenuOpen(g_api)) {
+        return false;
+    }
+    double sinceMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_lastPass).count();
+    int gameMs = 0;
+    if (GameNow(&gameMs) && gameMs == g_lastPassGameMs) {
+        return sinceMs >= 500.0; // paused
+    }
+    static const int kRates[] = {0, 60, 30, 15};
+    int fps = kRates[std::clamp(g_settings.refreshRate, 0, 3)];
+    return fps == 0 || sinceMs >= 0.85 * 1000.0 / fps; // the 0.85 keeps frame-time jitter from halving the rate
+}
+
 int RenderGamePre(DK2ML_Regs* regs, void*)
 {
     if (t_inHelmetPass) {
@@ -1682,7 +1737,7 @@ int RenderGamePre(DK2ML_Regs* regs, void*)
 
     bool alive = false;
     void* target = FindTarget(alive);
-    if (target && alive) {
+    if (target && alive && (g_texFill != -1 || PassDue(Entity_id(target)))) {
         Vec3 eye, fwd;
         BuildCamera(target, viewport, eye, fwd);
 
@@ -1718,6 +1773,14 @@ int RenderGamePre(DK2ML_Regs* regs, void*)
                            gv[2], gv[3], gv[4], gv[5], gv[6], gv[7], gv[8], gv[9], gv[10], gv[11]);
             }
         }
+
+        g_forcePass = false;
+        g_lastPass = std::chrono::steady_clock::now();
+        g_lastPassTarget = Entity_id(target);
+        GameNow(&g_lastPassGameMs);
+        ++g_passesDone;
+    } else if (target && alive) {
+        ++g_passesSkipped; // the last picture stays in our texture and is blitted again
     } else {
         FillSolid(0); // the operator died, or nobody is left: a black picture
     }
@@ -1773,8 +1836,12 @@ void HandleKey()
         if (g_open) {
             g_helmetFrames = 0;
             g_glLogBudget = 12;
+            g_forcePass = true;
+            g_passesDone = g_passesSkipped = 0;
+            g_api->Log("helmet cam opened");
+        } else {
+            LogPassStats("closed with the key");
         }
-        g_api->Log("helmet cam %s", g_open ? "opened" : "closed");
     }
 
     if (!down && g_keyWasDown && !g_keyIgnored && !g_keyConsumed && g_open) {
@@ -2128,7 +2195,7 @@ void OnStateChanged(const DK2ML_Event* e, void*)
 {
     if (e->newState != StateRunning.Get()) {
         if (g_open) {
-            g_api->Log("helmet cam closed: left the mission");
+            LogPassStats("left the mission");
         }
         ResetCam();
         g_windowOpen = false; // the Esc-menu button only exists in a mission
