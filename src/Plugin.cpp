@@ -143,13 +143,15 @@ dk2ml::TypeSize Vertex3D_size{"Render::Vertex3D"};
 
 // The red doors: an entity that an order will open, kick or destroy gets the game's "red ghost" look. The game does it in
 // Entity_Client::SetRedGhostEffect(entity, on) by rewriting each of the entity's render objects: alpha blending (blend
-// mode 1) and a diffuse colour of (2, 0, 0, 0.5). The plans flag does not undo that, so the helmet pass undoes it for the
-// doors and puts it back afterwards, using the game's own function both ways.
+// mode 1) and a diffuse colour of (2, 0, 0, 0.5). The plans flag does not undo that, so the helmet pass undoes it and puts
+// it back afterwards, using the game's own function both ways. It is the state of ANY client entity (doors, walls, ...):
+// SetAsGonnaBeDestroyed is its only caller, and the game's "cinematic mode off" handler clears it by walking every entity
+// in GameClient::m_entities, so the helmet pass walks that list too.
 dk2ml::Fn<void(void* entity, bool on)> Entity_SetRedGhostEffect{"Entity_Client::SetRedGhostEffect"};
-dk2ml::Global<uint8_t> Door_typeList{"Door_Client::typeList"};
-dk2ml::Field<void*> DoorList_head{"LinkedList<Door_Client>", "head"};
-dk2ml::Field<void*> DoorList_next{"LinkedList<Door_Client>", "next"};
-dk2ml::Field<void*> DoorList_owner{"LinkedList<Door_Client>", "owner"};
+dk2ml::Field<uint8_t> GameClient_entities{"GameClient", "m_entities"};
+dk2ml::Field<void*> EntityList_head{"LinkedList<Entity_Client>", "head"};
+dk2ml::Field<void*> EntityList_next{"LinkedList<Entity_Client>", "next"};
+dk2ml::Field<void*> EntityList_owner{"LinkedList<Entity_Client>", "owner"};
 dk2ml::Field<uint8_t> Entity_renderObjects{"Entity_Client", "m_renderObjects"}; // List<unsigned int>: render object ids
 dk2ml::Field<void*> ListId_data{"List<unsigned int>", "m_list"};
 dk2ml::Field<int> ListId_count{"List<unsigned int>", "m_elements"};
@@ -1616,7 +1618,7 @@ struct PassOverrides {
     bool plansBefore = false;
     bool changedNvg = false;
     bool nvgBefore = false;
-    std::vector<void*> redDoors; // doors that were red and are plain for the helmet pass
+    std::vector<void*> redEntities; // entities (doors, walls...) that were red and are plain for the helmet pass
     std::vector<std::pair<uint32_t*, uint32_t>> rayColors; // IR laser vertex colours set to 0 for the pass, and their values
     int raysHidden = 0;
 
@@ -1657,18 +1659,19 @@ struct PassOverrides {
             changedPlans = true;
             plans = false;
 
-            // The doors an order will open or kick are red; make them plain for this pass.
-            void* list = Door_typeList.Address();
+            // The doors and walls an order will open, kick or destroy are red; make them plain for this pass.
+            void* client = g_pGameClient ? *g_pGameClient : nullptr;
+            void* list = client ? static_cast<uint8_t*>(client) + GameClient_entities.Offset() : nullptr;
             if (list) {
-                void* end = dk2ml::At<void*>(list, DoorList_head.Offset());
-                void* node = dk2ml::At<void*>(list, DoorList_next.Offset());
-                for (int guard = 0; node && node != end && node != list && guard < 1024; ++guard) {
-                    void* door = dk2ml::At<void*>(node, DoorList_owner.Offset());
-                    if (door && HasRedGhost(r, door)) {
-                        Entity_SetRedGhostEffect(door, false);
-                        redDoors.push_back(door);
+                void* end = dk2ml::At<void*>(list, EntityList_head.Offset());
+                void* node = dk2ml::At<void*>(list, EntityList_next.Offset());
+                for (int guard = 0; node && node != end && node != list && guard < 50000; ++guard) {
+                    void* entity = dk2ml::At<void*>(node, EntityList_owner.Offset());
+                    if (entity && HasRedGhost(r, entity)) {
+                        Entity_SetRedGhostEffect(entity, false);
+                        redEntities.push_back(entity);
                     }
-                    node = dk2ml::At<void*>(node, DoorList_next.Offset());
+                    node = dk2ml::At<void*>(node, EntityList_next.Offset());
                 }
             }
         }
@@ -1696,8 +1699,8 @@ struct PassOverrides {
         for (auto& saved : rayColors) {
             *saved.first = saved.second; // the rays are back for the game's own frame
         }
-        for (void* door : redDoors) {
-            Entity_SetRedGhostEffect(door, true); // red again for the game's own frame
+        for (void* entity : redEntities) {
+            Entity_SetRedGhostEffect(entity, true); // red again for the game's own frame
         }
         if (toggledFow) {
             GameRenderer_ToggleFOW(renderer); // and back on
@@ -1803,10 +1806,10 @@ int RenderGamePre(DK2ML_Regs* regs, void*)
                        g_lastFixedEye.y, g_lastFixedEye.z, g_lastBoneOk ? "ok" : "unusable", g_lastBoneEye.x,
                        g_lastBoneEye.y, g_lastBoneEye.z, g_lastBoneOk ? "the bone" : "the fixed height");
             g_api->Log("  fog of war off in the helmet view: %d, hide plans: %d (game's plans flag was %d, now restored), "
-                       "red doors made plain for this pass: %d, night vision removed: %d (game's flag was %d, now restored), "
+                       "red entities (doors, walls) made plain for this pass: %d, night vision removed: %d (game's flag was %d, now restored), "
                        "IR laser rays hidden: %d",
                        g_settings.fowOff, g_settings.hidePlans, overrides.plansBefore,
-                       static_cast<int>(overrides.redDoors.size()), g_settings.hideNightVision, overrides.nvgBefore,
+                       static_cast<int>(overrides.redEntities.size()), g_settings.hideNightVision, overrides.nvgBefore,
                        overrides.raysHidden);
             g_api->Log("  our view: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", mv[0], mv[1],
                        mv[2], mv[3], mv[4], mv[5], mv[6], mv[7], mv[8], mv[9], mv[10], mv[11]);
