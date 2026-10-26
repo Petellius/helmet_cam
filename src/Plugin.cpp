@@ -132,6 +132,14 @@ dk2ml::Field<uint8_t> GameRenderer_renderOptions{"GameRenderer", "m_renderOption
 dk2ml::Field<bool> RenderOptions_plans{"GameRenderer::sRenderOptions", "plans"};
 // The night-vision look the renderer applies on night maps (sRenderOptions +80, next to colorCorrection).
 dk2ml::Field<bool> RenderOptions_nvg{"GameRenderer::sRenderOptions", "nvg"};
+// The vanilla night-time IR laser: every human owns a ray (a RenderObject2D quad) that the game's UpdateLaserLight shows
+// while it is night and the player's night vision is on. That runs in the update, not in RenderGame, so clearing `nvg` for
+// our pass doesn't hide it. The game hides a ray by writing colour 0 into the four vertices of its quad; so does our pass.
+dk2ml::Field<void*> Human_laserRay{"Human_Client", "m_pLaserRay"};
+dk2ml::Field<uint8_t> RenderObject2D_quad{"RenderObject2D", "quad"};
+dk2ml::Field<uint8_t> Quad_vertices{"Render2D::Quad", "v"};
+dk2ml::Field<uint32_t> Vertex3D_color{"Render::Vertex3D", "color"};
+dk2ml::TypeSize Vertex3D_size{"Render::Vertex3D"};
 
 // The red doors: an entity that an order will open, kick or destroy gets the game's "red ghost" look. The game does it in
 // Entity_Client::SetRedGhostEffect(entity, on) by rewriting each of the entity's render objects: alpha blending (blend
@@ -445,8 +453,8 @@ void BuildOptions()
     add(plans);
 
     DK2ML_Option nvg = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Remove night vision overlay in the helmet view",
-                        "On night maps the helmet picture is drawn without the night-vision effect. The scene may look "
-                        "darker. The main view is unaffected",
+                        "On night maps the helmet picture is drawn without the night-vision effect and the IR lasers. The "
+                        "scene may look darker. The main view is unaffected",
                         &g_settings.hideNightVision};
     nvg.onChange = SaveSettings;
     add(nvg);
@@ -1609,6 +1617,34 @@ struct PassOverrides {
     bool changedNvg = false;
     bool nvgBefore = false;
     std::vector<void*> redDoors; // doors that were red and are plain for the helmet pass
+    std::vector<std::pair<uint32_t*, uint32_t>> rayColors; // IR laser vertex colours set to 0 for the pass, and their values
+    int raysHidden = 0;
+
+    // Colour 0 on the four vertices of every human's laser ray, as the game does when the laser is off.
+    void HideLaserRays()
+    {
+        uint32_t stride = Vertex3D_size.Get();
+        if (stride == 0) {
+            return;
+        }
+        for (void* human : AllHumans()) {
+            void* ray = Human_laserRay(human);
+            if (!ray) {
+                continue;
+            }
+            uint8_t* vertices = static_cast<uint8_t*>(ray) + RenderObject2D_quad.Offset() + Quad_vertices.Offset();
+            bool hid = false;
+            for (int i = 0; i < 4; ++i) {
+                uint32_t& color = Vertex3D_color(vertices + i * stride);
+                if (color != 0) {
+                    rayColors.emplace_back(&color, color);
+                    color = 0;
+                    hid = true;
+                }
+            }
+            raysHidden += hid;
+        }
+    }
 
     void Apply(void* r)
     {
@@ -1641,6 +1677,7 @@ struct PassOverrides {
             nvgBefore = nvg;
             changedNvg = true;
             nvg = false; // restored in Restore, so the main view keeps its night vision
+            HideLaserRays();
         }
         if (g_settings.fowOff) {
             GameRenderer_ToggleFOW(r); // fog of war off (flag: disabled)
@@ -1655,6 +1692,9 @@ struct PassOverrides {
         }
         if (changedNvg) {
             RenderOptions_nvg(static_cast<uint8_t*>(renderer) + GameRenderer_renderOptions.Offset()) = nvgBefore;
+        }
+        for (auto& saved : rayColors) {
+            *saved.first = saved.second; // the rays are back for the game's own frame
         }
         for (void* door : redDoors) {
             Entity_SetRedGhostEffect(door, true); // red again for the game's own frame
@@ -1763,9 +1803,11 @@ int RenderGamePre(DK2ML_Regs* regs, void*)
                        g_lastFixedEye.y, g_lastFixedEye.z, g_lastBoneOk ? "ok" : "unusable", g_lastBoneEye.x,
                        g_lastBoneEye.y, g_lastBoneEye.z, g_lastBoneOk ? "the bone" : "the fixed height");
             g_api->Log("  fog of war off in the helmet view: %d, hide plans: %d (game's plans flag was %d, now restored), "
-                       "red doors made plain for this pass: %d, night vision removed: %d (game's flag was %d, now restored)",
+                       "red doors made plain for this pass: %d, night vision removed: %d (game's flag was %d, now restored), "
+                       "IR laser rays hidden: %d",
                        g_settings.fowOff, g_settings.hidePlans, overrides.plansBefore,
-                       static_cast<int>(overrides.redDoors.size()), g_settings.hideNightVision, overrides.nvgBefore);
+                       static_cast<int>(overrides.redDoors.size()), g_settings.hideNightVision, overrides.nvgBefore,
+                       overrides.raysHidden);
             g_api->Log("  our view: %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f", mv[0], mv[1],
                        mv[2], mv[3], mv[4], mv[5], mv[6], mv[7], mv[8], mv[9], mv[10], mv[11]);
             if (gv) {
