@@ -132,6 +132,9 @@ dk2ml::Field<uint8_t> GameRenderer_renderOptions{"GameRenderer", "m_renderOption
 dk2ml::Field<bool> RenderOptions_plans{"GameRenderer::sRenderOptions", "plans"};
 // The night-vision look the renderer applies on night maps (sRenderOptions +80, next to colorCorrection).
 dk2ml::Field<bool> RenderOptions_nvg{"GameRenderer::sRenderOptions", "nvg"};
+// The final post-processed colour of the frame (single-sample): RenderGame draws it to the back buffer at its end, before the
+// world-space UI. Reading it is cheaper than resolving the multisampled back buffer.
+dk2ml::Field<uint32_t> GameRenderer_currentScreenColorTexture{"GameRenderer", "m_currentScreenColorTexture"};
 // The vanilla night-time IR laser: every human owns a ray (a RenderObject2D quad) that the game's UpdateLaserLight shows
 // while it is night and the player's night vision is on. That runs in the update, not in RenderGame, so clearing `nvg` for
 // our pass doesn't hide it. The game hides a ray by writing colour 0 into the four vertices of its quad; so does our pass.
@@ -216,6 +219,7 @@ struct Settings {
     int offsetY = 16;
     int sizePercent = 25;        // picture width as a percentage of the window width
     bool hideNightVision = false; // no night-vision overlay in the helmet picture
+    int captureSource = 0;       // config file only: 0 automatic, 1 always the back buffer, 2 always the game's own texture
     int refreshRate = 2;         // how often the helmet view is re-rendered: 0 every frame, 1 60, 2 30, 3 15 fps
     bool colorName = true;       // ...on a chip in the colour of the operator's path, while Colored plans is on
     bool fowOff = false;         // fog of war off for the helmet pass (the game's own FPS camera does this too)
@@ -271,6 +275,7 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.sizePercent = std::clamp(ReadInt(file, L"size_percent", s.sizePercent), 10, 60);
     s.hideNightVision = ReadInt(file, L"hide_night_vision", s.hideNightVision) != 0;
     s.refreshRate = std::clamp(ReadInt(file, L"refresh_rate", s.refreshRate), 0, 3);
+    s.captureSource = std::clamp(ReadInt(file, L"capture_source", s.captureSource), 0, 2);
     s.colorName = ReadInt(file, L"color_name", s.colorName) != 0;
     s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
     s.hidePlans = ReadInt(file, L"hide_plans", s.hidePlans) != 0;
@@ -320,6 +325,7 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"size_percent", g_settings.sizePercent);
     write(L"hide_night_vision", g_settings.hideNightVision);
     write(L"refresh_rate", g_settings.refreshRate);
+    write(L"capture_source", g_settings.captureSource);
     write(L"color_name", g_settings.colorName);
     write(L"fow_off", g_settings.fowOff);
     write(L"hide_plans", g_settings.hidePlans);
@@ -1404,6 +1410,18 @@ bool EnsureFullCopy(int w, int h)
     return true;
 }
 
+void DestroyFullCopy()
+{
+    if (g_fullFbo) {
+        (*gl_DeleteFramebuffers)(1, &g_fullFbo);
+    }
+    if (g_fullTex) {
+        glDeleteTextures(1, &g_fullTex);
+    }
+    g_fullFbo = g_fullTex = 0;
+    g_fullW = g_fullH = 0;
+}
+
 // The finished frame is in the back buffer: shrink it into our texture.
 void CaptureBackBuffer(int viewW, int viewH)
 {
@@ -1437,6 +1455,209 @@ void CaptureBackBuffer(int viewW, int viewH)
     (*gl_BindFramebuffer)(kReadFramebuffer, 0);
     glReadBuffer(static_cast<GLenum>(previousRead));
     RestoreGl(saved);
+    g_texFill = -1;
+}
+
+// --- capturing from the game's own final colour texture instead of the back buffer ---
+// The game resolves its multisampling itself and ends RenderGame by drawing m_currentScreenColorTexture (final colours, one
+// sample) to the back buffer. Blitting that texture straight into our picture skips the full-size multisample resolve and
+// the full-size copy of the window. It is used only while the picture is not expected to hold the world-space UI the game
+// draws after it (Hide plans on), and only after a calibration proved it matches the back buffer's picture, and in which
+// orientation. Anything unexpected falls back to the back buffer for the rest of the session.
+enum CaptureMode { kCapUndecided, kCapBackBuffer, kCapGame, kCapGameFlipped };
+int g_capMode = kCapUndecided;
+int g_calibrationTries = 0;
+constexpr int kMaxCalibrationTries = 12;
+GLuint g_srcFbo = 0;                                            // a read framebuffer around the game's texture
+std::unordered_map<GLuint, std::pair<int, int>> g_gameTexSizes; // texture id -> its size, read once
+
+bool GameTextureWanted()
+{
+    return g_settings.captureSource != 1 && g_capMode != kCapBackBuffer &&
+           (g_settings.hidePlans || g_settings.captureSource == 2);
+}
+
+void UseBackBufferFromNowOn(const char* why)
+{
+    g_capMode = kCapBackBuffer;
+    g_api->Log("helmet cam: capturing from the back buffer (%s)", why);
+}
+
+bool GameTextureSize(GLuint tex, int& w, int& h)
+{
+    auto known = g_gameTexSizes.find(tex);
+    if (known != g_gameTexSizes.end()) {
+        w = known->second.first;
+        h = known->second.second;
+        return true;
+    }
+    GlSaved saved;
+    SaveGl(saved);
+    for (int i = 0; i < 8 && glGetError() != GL_NO_ERROR; ++i) {
+    }
+    glBindTexture(GL_TEXTURE_2D, tex);
+    GLint tw = 0, th = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+    bool ok = glGetError() == GL_NO_ERROR && tw > 0 && th > 0 && tw <= 16384 && th <= 16384;
+    RestoreGl(saved);
+    if (ok) {
+        if (g_gameTexSizes.size() > 16) {
+            g_gameTexSizes.clear();
+        }
+        g_gameTexSizes[tex] = {tw, th};
+        w = tw;
+        h = th;
+    }
+    return ok;
+}
+
+// The game's texture, scaled into our picture; flipped upside down when the calibration said so.
+bool BlitGameTexture(GLuint tex, int tw, int th, bool flip, bool checkComplete)
+{
+    GlSaved saved;
+    SaveGl(saved);
+    glDisable(kScissorTest);
+    if (!g_srcFbo) {
+        (*gl_GenFramebuffers)(1, &g_srcFbo);
+    }
+    (*gl_BindFramebuffer)(kReadFramebuffer, g_srcFbo);
+    (*gl_FramebufferTexture2D)(kReadFramebuffer, kColorAttachment0, GL_TEXTURE_2D, tex, 0);
+    bool ok = !checkComplete || (*gl_CheckFramebufferStatus)(kReadFramebuffer) == kFramebufferComplete;
+    if (ok) {
+        (*gl_BindFramebuffer)(kDrawFramebuffer, g_fbo);
+        (*gl_BlitFramebuffer)(0, 0, tw, th, 0, flip ? g_texH : 0, g_texW, flip ? 0 : g_texH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    }
+    RestoreGl(saved);
+    return ok;
+}
+
+// Our picture as a coarse grid of average colours (kGridW x kGridH cells, rows bottom-first as read back).
+constexpr int kGridW = 24;
+constexpr int kGridH = 15;
+using Grid = std::vector<float>; // kGridW * kGridH * 3
+
+void PictureGrid(Grid& grid)
+{
+    GlSaved saved;
+    SaveGl(saved);
+    (*gl_BindFramebuffer)(kReadFramebuffer, g_fbo);
+    GLint packAlignment = 4;
+    glGetIntegerv(GL_PACK_ALIGNMENT, &packAlignment);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    std::vector<unsigned char> pixels(static_cast<size_t>(g_texW) * g_texH * 4);
+    glReadPixels(0, 0, g_texW, g_texH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glPixelStorei(GL_PACK_ALIGNMENT, packAlignment);
+    RestoreGl(saved);
+
+    grid.assign(static_cast<size_t>(kGridW) * kGridH * 3, 0.0f);
+    std::vector<int> counts(static_cast<size_t>(kGridW) * kGridH, 0);
+    for (int y = 0; y < g_texH; y += 4) {
+        for (int x = 0; x < g_texW; x += 4) {
+            size_t cell = static_cast<size_t>(y * kGridH / g_texH) * kGridW + static_cast<size_t>(x * kGridW / g_texW);
+            const unsigned char* px = &pixels[(static_cast<size_t>(y) * g_texW + x) * 4];
+            grid[cell * 3] += px[0];
+            grid[cell * 3 + 1] += px[1];
+            grid[cell * 3 + 2] += px[2];
+            ++counts[cell];
+        }
+    }
+    for (size_t cell = 0; cell < counts.size(); ++cell) {
+        for (int c = 0; c < 3 && counts[cell] > 0; ++c) {
+            grid[cell * 3 + c] /= static_cast<float>(counts[cell]);
+        }
+    }
+}
+
+// Mean absolute colour difference (0-255) between two grids; b may be read upside down.
+float GridDifference(const Grid& a, const Grid& b, bool flipB)
+{
+    float sum = 0.0f;
+    for (int y = 0; y < kGridH; ++y) {
+        for (int x = 0; x < kGridW; ++x) {
+            int by = flipB ? kGridH - 1 - y : y;
+            for (int c = 0; c < 3; ++c) {
+                sum += std::fabs(a[(static_cast<size_t>(y) * kGridW + x) * 3 + c] -
+                                 b[(static_cast<size_t>(by) * kGridW + x) * 3 + c]);
+            }
+        }
+    }
+    return sum / (kGridW * kGridH * 3);
+}
+
+// One calibration try, on a frame whose picture was just captured from the back buffer: capture the same frame from the
+// game's texture too and compare. Decisive and close -> use the texture (flipped or not). Not decisive (a very dark or
+// uniform scene) -> try again on a later view. Never decisive -> the back buffer for good.
+void CalibrateGameTexture(GLuint tex, int viewW, int viewH)
+{
+    int tw = 0, th = 0;
+    if (!GameTextureSize(tex, tw, th)) {
+        UseBackBufferFromNowOn("the game's colour texture could not be inspected");
+        return;
+    }
+    // It has to be the window-sized final image (a scaled or supersampled buffer is fine if the aspect ratio matches).
+    if (std::fabs(static_cast<float>(tw) * viewH - static_cast<float>(th) * viewW) > 0.02f * static_cast<float>(th) * viewW) {
+        char why[128];
+        snprintf(why, sizeof(why), "the game's colour texture is %dx%d for a %dx%d window", tw, th, viewW, viewH);
+        UseBackBufferFromNowOn(why);
+        return;
+    }
+
+    Grid fromBackBuffer, fromGame;
+    PictureGrid(fromBackBuffer);
+    if (!BlitGameTexture(tex, tw, th, false, true)) {
+        UseBackBufferFromNowOn("the game's colour texture is not usable as a read framebuffer");
+        return;
+    }
+    PictureGrid(fromGame);
+    float same = GridDifference(fromBackBuffer, fromGame, false);
+    float flipped = GridDifference(fromBackBuffer, fromGame, true);
+    float best = std::min(same, flipped);
+    float other = std::max(same, flipped);
+    bool decisive = best < 14.0f && other - best > 5.0f;
+    ++g_calibrationTries;
+    if (decisive) {
+        g_capMode = same <= flipped ? kCapGame : kCapGameFlipped;
+        g_api->Log("helmet cam: capturing from the game's final colour texture %dx%d (%s), calibration difference %.1f against "
+                   "%.1f the other way; the full-size copy is freed",
+                   tw, th, g_capMode == kCapGameFlipped ? "flipped" : "as is", best, other);
+        BlitGameTexture(tex, tw, th, g_capMode == kCapGameFlipped, false);
+        DestroyFullCopy(); // the 37 MB copy the back buffer path needed is not needed any more
+        return;
+    }
+    if (g_calibrationTries >= kMaxCalibrationTries) {
+        char why[160];
+        snprintf(why, sizeof(why), "calibration never became decisive (last differences %.1f and %.1f)", same, flipped);
+        UseBackBufferFromNowOn(why);
+    }
+    // Not decided yet: put the back buffer's picture back (our blit overwrote it).
+    CaptureBackBuffer(viewW, viewH);
+}
+
+// Capture the helmet picture right after the nested RenderGame: from the game's texture when proven good, else the back buffer.
+void CaptureHelmetPicture(void* renderer, int viewW, int viewH)
+{
+    if (!GameTextureWanted()) {
+        CaptureBackBuffer(viewW, viewH);
+        return;
+    }
+    GLuint tex = GameRenderer_currentScreenColorTexture(renderer);
+    if (tex == 0) {
+        CaptureBackBuffer(viewW, viewH);
+        return;
+    }
+    if (g_capMode == kCapGame || g_capMode == kCapGameFlipped) {
+        int tw = 0, th = 0;
+        if (GameTextureSize(tex, tw, th) && BlitGameTexture(tex, tw, th, g_capMode == kCapGameFlipped, false)) {
+            g_texFill = -1;
+            return;
+        }
+        UseBackBufferFromNowOn("the game's colour texture stopped being usable");
+        CaptureBackBuffer(viewW, viewH);
+        return;
+    }
+    CaptureBackBuffer(viewW, viewH); // undecided: the back buffer's picture, plus one calibration try
+    CalibrateGameTexture(tex, viewW, viewH);
     g_texFill = -1;
 }
 
@@ -1724,6 +1945,40 @@ struct FrameInfo {
     int viewW = 0, viewH = 0;
 } g_frame;
 
+// The picture buffers are only needed while the cam is open. After it has been closed this long they are freed (the
+// full-size copy of the back buffer alone is about 37 MB on a 3840x2400 window); opening the cam makes them again. The wait
+// keeps a quick close and reopen from reallocating. GL calls need the render thread, so this runs from the render hook.
+constexpr ULONGLONG kFreeAfterClosedMs = 10000;
+ULONGLONG g_closedSince = 0;
+
+void FreeBuffersWhenIdle()
+{
+    if (!g_fbo && !g_tex && !g_fullFbo && !g_fullTex && !g_srcFbo) {
+        g_closedSince = 0;
+        return;
+    }
+    ULONGLONG now = GetTickCount64();
+    if (g_closedSince == 0) {
+        g_closedSince = now;
+        return;
+    }
+    if (now - g_closedSince < kFreeAfterClosedMs) {
+        return;
+    }
+    DestroyResources();
+    DestroyFullCopy();
+    if (g_srcFbo) {
+        (*gl_DeleteFramebuffers)(1, &g_srcFbo);
+        g_srcFbo = 0;
+    }
+    g_gameTexSizes.clear();
+    std::vector<unsigned char>().swap(g_fillPixels); // gives the memory back, clear() would not
+    g_texFill = -1;
+    g_forcePass = true; // the next open draws a fresh picture
+    g_closedSince = 0;
+    g_api->Log("helmet cam: picture buffers freed (the cam was closed for %llu s)", kFreeAfterClosedMs / 1000);
+}
+
 // Is a new helmet view due? The expensive part (the nested scene render) runs only when it is: at the refresh rate, at once
 // for a new operator or texture, never while the window is unfocused or a game menu is open, and only twice a second while
 // the game is paused (its time stands still), so a changed setting still shows up. In between, the last picture is reused.
@@ -1752,8 +2007,12 @@ int RenderGamePre(DK2ML_Regs* regs, void*)
     }
     g_frame.active = false;
     if (!g_settings.enabled || !g_open || !InMission()) {
+        if (!g_open) {
+            FreeBuffersWhenIdle();
+        }
         return DK2ML_CALL_ORIGINAL;
     }
+    g_closedSince = 0; // open again: the buffers stay
 
     void* renderer = dk2ml::Arg<void*>(regs, 0);
     const int* viewport = dk2ml::Arg<const int*>(regs, 1);
@@ -1793,8 +2052,8 @@ int RenderGamePre(DK2ML_Regs* regs, void*)
         overrides.Restore();
         GlStage("in the nested RenderGame");
 
-        CaptureBackBuffer(viewport[2], viewport[3]);
-        GlStage("in the back buffer capture blit");
+        CaptureHelmetPicture(renderer, viewport[2], viewport[3]);
+        GlStage("in the picture capture");
 
         if (g_helmetFrames < 3) {
             ++g_helmetFrames;
