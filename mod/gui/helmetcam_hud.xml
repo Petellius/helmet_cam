@@ -77,23 +77,23 @@ smaller than its 104 px art (88 px). A separate file, so hud.xml stays the game'
 				<Action type="Callback" target="#helmetcam_wheel"/>
 			</OnClick>
 		</Button>
-		<Button name="#helmetcam_wheel_lock_a" origin="-68 188" sizeX="96" sizeY="96" tooltip="Lock: off. Click to lock the helmet cam to the selected operator">
-			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_a_normal.dds"/>
+		<Button name="#helmetcam_wheel_fx_a" origin="-68 188" sizeX="96" sizeY="96" tooltip="Bodycam and fisheye: off. Click to turn both on">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_fx_a_normal.dds"/>
 			<OnHover>
-				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_a_hover.dds"/>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_fx_a_hover.dds"/>
 			</OnHover>
 			<OnClick>
-				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_a_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_fx_a_hover.dds" scaleX="0.9" scaleY="0.9"/>
 				<Action type="Callback" target="#helmetcam_wheel"/>
 			</OnClick>
 		</Button>
-		<Button name="#helmetcam_wheel_lock_b" origin="-68 188" sizeX="96" sizeY="96" hidden="true" tooltip="Lock: on. Click to unlock the helmet cam">
-			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_b_normal.dds"/>
+		<Button name="#helmetcam_wheel_fx_b" origin="-68 188" sizeX="96" sizeY="96" hidden="true" tooltip="Bodycam and fisheye: on. Click to turn both off">
+			<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_fx_b_normal.dds"/>
 			<OnHover>
-				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_b_hover.dds"/>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_fx_b_hover.dds"/>
 			</OnHover>
 			<OnClick>
-				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_lock_b_hover.dds" scaleX="0.9" scaleY="0.9"/>
+				<RenderObject2D texture="data/textures/hud/dk2ml_helmetcam_fx_b_hover.dds" scaleX="0.9" scaleY="0.9"/>
 				<Action type="Callback" target="#helmetcam_wheel"/>
 			</OnClick>
 		</Button>

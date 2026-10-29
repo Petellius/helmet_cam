@@ -1,6 +1,57 @@
 <Mod
 	title="Helmet Cam"
-	description="Work in progress: a first-person helmet camera picture-in-picture for allied operators, in missions and replays. Requires the Door Kickers 2 Modloader (dk2ml.dll and dbghelp.dll in the game folder)."
+	description="First-person [b]helmet cameras[/b] for Door Kickers 2. Watch the mission or replay through an operator&apos;s eyes in a small picture in the corner, live, while the main view keeps working as normal.
+
+Everything is configurable through the [url=https://github.com/gabrweu/doorkickers-modloader]Modloader[/url] menu or through the helmet button in the HUD. [b]Requires the Modloader[/b]: see Installation below.
+
+[h1]Features[/h1]
+
+[b]Helmet cam on your operators[/b]
+Works in missions and in replays, and follows pause, speed and skipping exactly. A fallen operator&apos;s cam goes black.
+
+[b]Quick controls[/b]
+[list]
+    [*] Hold [b]H[/b] to open or close the cam. The key can be changed.
+    [*] Tap [b]H[/b] to switch to the next operator.
+    [*] The operator&apos;s name sits on the picture, in the colour of their path.
+[/list]
+
+[b]Automatic switching[/b]
+The cam follows your selection: it jumps to whoever you select, either at once or when you tap the key.
+[img]https://raw.githubusercontent.com/Petellius/dk2-workshop-media/main/helmet-cam/auto-switch.gif[/img]
+
+[b]Action cam[/b]
+Follows the fight: when the operator you&apos;re watching stops shooting or aiming, the cam switches to another operator who is in combat.
+[img]https://raw.githubusercontent.com/Petellius/dk2-workshop-media/main/helmet-cam/action-cam.gif[/img]
+
+[b]HUD menu[/b]
+Click the helmet icon in the HUD bar to open a small menu of quick toggles: selection mode, bodycam and fisheye effects, action cam and night vision. Also available in replays.
+[img]https://raw.githubusercontent.com/Petellius/dk2-workshop-media/main/helmet-cam/icon-menu.png[/img]
+
+[b]Clean view[/b]
+The picture hides plans, paths, door and wall highlights and, optionally, the night vision overlay and IR lasers, so it looks like a real helmet cam.
+[img]https://raw.githubusercontent.com/Petellius/dk2-workshop-media/main/helmet-cam/hide-in-game-ui.png[/img]
+[img]https://raw.githubusercontent.com/Petellius/dk2-workshop-media/main/helmet-cam/night-vision.gif[/img]
+
+[b]Your picture, your way[/b]
+Pick the corner, the offset and the size of the picture, plus field of view and camera position. Optional cams for enemies and civilians too.
+[img]https://raw.githubusercontent.com/Petellius/dk2-workshop-media/main/helmet-cam/config-options.jpg[/img]
+
+[b]The helmet cam renders the scene a second time while it is open, so it costs frame rate.[/b] A refresh rate setting (30 fps by default) keeps it light, and nothing extra is drawn while the cam is closed, the game is paused or a menu is open.
+
+[h1]Installation[/h1]
+[olist]
+    [*] Install the [url=https://github.com/gabrweu/doorkickers-modloader/releases]Modloader[/url]: close the game, download the release, and copy [b]dk2ml.dll[/b] and [b]dbghelp.dll[/b] into the game&apos;s folder (Steam: right-click Door Kickers 2 &gt; Manage &gt; Browse local files).
+    [*] Subscribe to this mod, start the game and enable it in the Mods menu.
+    [*] [b]Quit the game completely and start it again through Steam.[/b] The restart option in the Mods menu does not load DLL mods.
+    [*] When Windows asks about loading external code, choose Continue.
+[/olist]
+If you already use the Modloader for another mod, such as era&apos;s Free Camera, step 1 is done. Mods with code can run anything on your PC, so only install mods from sources you trust.
+
+[h1]Credits[/h1]
+Modloader by era.
+
+Images include: era&apos;s lasers and lights, era&apos;s free cam, ARES unit mod."
 	author="Petellius"
 	tags="Other"
 	changeNotes=""

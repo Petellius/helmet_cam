@@ -927,7 +927,6 @@ void LogPassStats(const char* why)
                fps ? std::to_string(fps).append(" fps").c_str() : "every frame");
 }
 bool g_cycleRequested = false;
-uint32_t g_lockedId = 0;        // the HUD lock button: the cam stays on this operator until unlocked (or they die)
 bool g_selectionPending = false; // the player selected someone the cam hasn't gone to: the next tap goes there
 
 uint32_t SelectedOperatorId();
@@ -960,7 +959,6 @@ void ResetCam()
     g_open = false;
     g_targetId = 0;
     g_cycleRequested = false;
-    g_lockedId = 0;
     g_selectionPending = false;
     g_lastSwitchMs = kNever;
     g_lastSelectedId = 0;
@@ -982,23 +980,6 @@ void* FindTarget(bool& alive)
     }
     if (ops.empty()) {
         return nullptr;
-    }
-
-    // Locked: the cam stays on that operator, taps do nothing. The lock ends when they die or leave the list.
-    if (g_lockedId != 0) {
-        void* locked = nullptr;
-        for (void* op : ops) {
-            if (Entity_id(op) == g_lockedId) {
-                locked = op;
-            }
-        }
-        if (locked && IsAlive(locked)) {
-            g_targetId = g_lockedId;
-            g_cycleRequested = false;
-        } else {
-            g_api->Log("helmet cam unlocked: operator %u is gone", g_lockedId);
-            g_lockedId = 0;
-        }
     }
 
     int current = -1;
@@ -1184,31 +1165,6 @@ void SwitchTo(void* op, const char* reason, int now)
     g_api->Log("auto switch (%s): operator %u '%s'", reason, g_targetId, name ? name : "");
 }
 
-// The HUD lock button: lock the cam to the selected operator (the cam's current one when nobody is selected), or unlock.
-void ToggleLock()
-{
-    if (g_lockedId != 0) {
-        g_api->Log("helmet cam unlocked from operator %u", g_lockedId);
-        g_lockedId = 0;
-        return;
-    }
-    uint32_t id = SelectedOperatorId();
-    if (id == 0) {
-        id = g_targetId;
-    }
-    for (void* h : AllHumans()) {
-        if (IsOperator(h) && Entity_id(h) == id && IsAlive(h)) {
-            g_lockedId = id;
-            g_targetId = id;
-            g_selectionPending = false;
-            const char* name = Entity_name(h);
-            g_api->Log("helmet cam locked to operator %u '%s'", id, name ? name : "");
-            return;
-        }
-    }
-    g_api->Log("helmet cam lock: no living operator to lock to");
-}
-
 // Runs every frame in a mission. Selection changes switch at once (instant mode); engagement (action cam) switches wait
 // for the cooldown, which only they start.
 void UpdateAutoTarget()
@@ -1229,8 +1185,8 @@ void UpdateAutoTarget()
         g_selectionPending = true;
     }
 
-    if (g_lockedId != 0 || (g_settings.selectionMode != 1 && !g_settings.engageSwitch)) {
-        return; // locked: nothing moves the cam
+    if (g_settings.selectionMode != 1 && !g_settings.engageSwitch) {
+        return; // nothing switches the cam by itself
     }
 
     std::vector<void*> ops;
@@ -2675,11 +2631,11 @@ void DrawTimestamp()
 // --- the HUD widget: one Helmet Cam icon in the game's bottom HUD bar; clicking it fans out an arc of buttons ---
 // mod\gui\helmetcam_hud.xml (like Free Camera's wheel). There is one main icon per bar ("HUD" live, "HUD_Replay_Full" in
 // replays; an item has one parent), and one shared arc ("wheel") that moves into the icon in use while the arc is open (a
-// click on the icon opens it, another click on it or anywhere else closes it). The arc holds four controls, each an item pair "_a"/"_b" (the state buttons): selection mode, lock,
-// action cam, night vision. Items are found after every GUI_LOADED and moved each time the HUD changes.
+// click on the icon opens it, another click on it or anywhere else closes it). The arc holds four controls, each an item pair "_a"/"_b" (the state buttons): selection mode, the bodycam and
+// fisheye effects, action cam, night vision. Items are found after every GUI_LOADED and moved each time the HUD changes.
 dk2ml::Enum EVENT_CLICK{"GUI::Item::eItemEventType", "EVENT_CLICK"};
 
-enum HudControl { kHudSelect, kHudLock, kHudAction, kHudNightVision, kHudControls };
+enum HudControl { kHudSelect, kHudEffects, kHudAction, kHudNightVision, kHudControls };
 
 struct HudWidget {
     void* menu[2] = {};    // the main icon items: [0] live bar, [1] replay bar
@@ -2706,7 +2662,7 @@ bool HudState(int control) // true: the second ("_b") button
 {
     switch (control) {
     case kHudSelect: return g_settings.selectionMode == 1;
-    case kHudLock: return g_lockedId != 0;
+    case kHudEffects: return g_settings.fisheye && g_settings.bodycamOverlay; // lit only while both are on
     case kHudAction: return g_settings.engageSwitch;
     default: return g_settings.hideNightVision;
     }
@@ -2739,7 +2695,12 @@ void OnHudClick(void*, float, float, void* user)
     g_ourClickFrame = g_frameNo;
     switch (static_cast<int>(reinterpret_cast<intptr_t>(user))) {
     case kHudSelect: g_settings.selectionMode = g_settings.selectionMode == 1 ? 0 : 1; break;
-    case kHudLock: ToggleLock(); return;
+    case kHudEffects: {
+        bool on = !(g_settings.fisheye && g_settings.bodycamOverlay); // both on, unless both already are
+        g_settings.fisheye = on;
+        g_settings.bodycamOverlay = on;
+        break;
+    }
     case kHudAction: g_settings.engageSwitch = !g_settings.engageSwitch; break;
     default: g_settings.hideNightVision = !g_settings.hideNightVision; break;
     }
@@ -2767,7 +2728,7 @@ void OnGuiLoaded(const DK2ML_Event*, void*)
     }
 
     g_hud.wheel = dk2ml::gui::Find(g_api, "#helmetcam_wheel");
-    static const char* const kNames[kHudControls] = {"select", "lock", "action", "nv"};
+    static const char* const kNames[kHudControls] = {"select", "fx", "action", "nv"};
     for (int i = 0; g_hud.wheel && i < kHudControls; ++i) {
         char name[64];
         snprintf(name, sizeof(name), "#helmetcam_wheel_%s_a", kNames[i]);

@@ -1,4 +1,4 @@
-"""Draws the HUD widget's icons: mod/textures/hud/dk2ml_helmetcam_<menu|select|lock|action|nv>_<a|b>_<normal|hover>.dds and
+"""Draws the HUD widget's icons: mod/textures/hud/dk2ml_helmetcam_<menu|select|fx|action|nv>_<a|b>_<normal|hover>.dds and
 the arc ring behind them (dk2ml_helmetcam_wheel_ring.dds).
 
 The look follows the game's own HUD toggles (round dark badge, cream glyph, broken ring; hover = inverted). The "_b" state
@@ -44,18 +44,19 @@ def glyph_select(d, fg, active):
         d.rounded_rectangle([px(62), px(34), px(78), px(50)], radius=px(3), outline=fg, width=px(3))
 
 
-def glyph_lock(d, fg, active):
-    # padlock; passive = open shackle, active = closed
-    d.rounded_rectangle([px(32), px(48), px(72), px(76)], radius=px(5), fill=fg)
+def glyph_fx(d, fg, active, hover):
+    # a body camera: body with a lens and a mounting clip, and a recording dot (hollow when off, red when both effects are on)
+    hole = CREAM if hover else DARK
+    d.rounded_rectangle([px(44), px(27), px(60), px(34)], radius=px(2), fill=fg)          # the mount on top
+    d.rounded_rectangle([px(29), px(33), px(75), px(71)], radius=px(6), fill=fg)         # the body
+    d.ellipse([px(40), px(39), px(62), px(61)], fill=hole)                                # the lens
+    d.ellipse([px(44), px(43), px(58), px(57)], outline=fg, width=px(2))
+    d.ellipse([px(49), px(48), px(53), px(52)], fill=fg)
+    d.rounded_rectangle([px(36), px(64), px(50), px(67)], radius=px(1), fill=hole)        # a button
     if active:
-        d.arc([px(38), px(24), px(66), px(60)], 180, 360, fill=fg, width=px(5))
-        d.line([px(40), px(42), px(40), px(50)], fill=fg, width=px(5))
-        d.line([px(64), px(42), px(64), px(50)], fill=fg, width=px(5))
+        d.ellipse([px(64), px(37), px(72), px(45)], fill=(255, 60, 60))                   # recording
     else:
-        d.arc([px(38), px(24), px(66), px(60)], 180, 360, fill=fg, width=px(5))
-        d.line([px(40), px(42), px(40), px(50)], fill=fg, width=px(5))
-        d.line([px(64), px(40), px(64), px(34)], fill=fg, width=px(5))
-    d.ellipse([px(48), px(57), px(56), px(65)], fill=DARK if fg != DARK else CREAM)
+        d.ellipse([px(64), px(37), px(72), px(45)], outline=hole, width=px(2))
 
 
 def glyph_action(d, fg, active):
@@ -117,8 +118,8 @@ def make(control, active, hover):
         glyph_menu(d, fg, active, hover)
     elif control == 'select':
         glyph_select(d, fg, active)
-    elif control == 'lock':
-        glyph_lock(d, fg, active)
+    elif control == 'fx':
+        glyph_fx(d, fg, active, hover)
     elif control == 'action':
         glyph_action(d, fg, active)
     else:
@@ -146,7 +147,7 @@ def write_dds(path, img):
 def main():
     os.makedirs(OUT, exist_ok=True)
     count = 0
-    for control in ('menu', 'select', 'lock', 'action', 'nv'):
+    for control in ('menu', 'select', 'fx', 'action', 'nv'):
         for state, active in (('a', False), ('b', True)):
             for look, hover in (('normal', False), ('hover', True)):
                 write_dds(os.path.join(OUT, 'dk2ml_helmetcam_%s_%s_%s.dds' % (control, state, look)), make(control, active, hover))
