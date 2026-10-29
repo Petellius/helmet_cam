@@ -262,7 +262,6 @@ struct Settings {
     int holdMs = 250;
     float fov = 45.0f;           // degrees (30-90)
     float offsetForward = 0.15f; // metres ahead of the entity, along the gaze
-    float offsetUp = 0.0f;       // metres added to the head height (1.58 standing, 1.14 crouched)
     int testPicture = 0;         // debug: 0 helmet view, 1 mirror of the main view, 2 solid color
     int anchor = 0;              // corner of the window the picture sits in: 0 top right, 1 top left, 2 bottom left, 3 bottom right
     int offsetX = 16;            // pixels in from that corner
@@ -282,7 +281,6 @@ struct Settings {
     bool engageSwitch = false;             // switch to an operator who is engaging when the cam's one isn't
     int cooldownMs = 650;                // after any switch, engagement switching waits this long (game time)
     int engageHoldMs = 900;               // the cam's operator stays "engaging" this long after their last shot or sighting
-    bool engageOnAim = true;               // aiming at an enemy the operator can see counts, not just shots
     int aimSettleMs = 400;                 // ...once the aim has been held on that enemy this long
     bool logOperators = false;
     bool allowAllHumans = false; // enemies, civilians and hostages count as operators too (their own helmet cams)
@@ -314,10 +312,8 @@ void ReadIni(const std::wstring& file, Settings& s)
 {
     ReadFloat(file, L"fov", s.fov);
     ReadFloat(file, L"offset_forward", s.offsetForward);
-    ReadFloat(file, L"offset_up", s.offsetUp);
     s.fov = std::clamp(s.fov, 30.0f, 90.0f);
     s.offsetForward = std::clamp(s.offsetForward, -0.5f, 1.0f);
-    s.offsetUp = std::clamp(s.offsetUp, -0.5f, 0.5f);
     s.enabled = ReadInt(file, L"enabled", s.enabled) != 0;
     s.key = ReadInt(file, L"key", s.key);
     s.holdMs = std::clamp(ReadInt(file, L"hold_ms", s.holdMs), 100, 1000);
@@ -341,7 +337,6 @@ void ReadIni(const std::wstring& file, Settings& s)
     }
     s.selectionMode = std::clamp(ReadInt(file, L"selection_mode", s.selectionMode), 0, 1);
     s.engageSwitch = ReadInt(file, L"engage_switch", s.engageSwitch) != 0;
-    s.engageOnAim = ReadInt(file, L"engage_on_aim", s.engageOnAim) != 0;
     s.cooldownMs = std::clamp(ReadInt(file, L"cooldown_ms", s.cooldownMs), 100, 4000);
     s.engageHoldMs = std::clamp(ReadInt(file, L"engage_hold_ms", s.engageHoldMs), 100, 4000);
     s.aimSettleMs = std::clamp(ReadInt(file, L"aim_settle_ms", s.aimSettleMs), 0, 1000);
@@ -370,7 +365,6 @@ void SaveSettings(const DK2ML_Option*, void*)
     };
     writeFloat(L"fov", g_settings.fov);
     writeFloat(L"offset_forward", g_settings.offsetForward);
-    writeFloat(L"offset_up", g_settings.offsetUp);
 
     write(L"enabled", g_settings.enabled);
     write(L"key", g_settings.key);
@@ -394,7 +388,6 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"aim_settle_ms", g_settings.aimSettleMs);
     write(L"selection_mode", g_settings.selectionMode);
     write(L"engage_switch", g_settings.engageSwitch);
-    write(L"engage_on_aim", g_settings.engageOnAim);
     write(L"log_operators", g_settings.logOperators);
     write(L"allow_all_humans", g_settings.allowAllHumans);
 }
@@ -466,14 +459,6 @@ void BuildOptions()
            &g_settings.fov, 30.0f, 90.0f, "%.0f deg");
     slider("Forward offset", "Moves the camera ahead of the operator (negative: behind), in metres", &g_settings.offsetForward,
            -0.5f, 1.0f, "%.2f m");
-    slider("Height offset", "Raises or lowers the camera from the head height (1.58 m standing, 1.14 m crouched)",
-           &g_settings.offsetUp, -0.5f, 0.5f, "%.2f m");
-
-    DK2ML_Option any = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Allow enemy and civilian helmet cams",
-                        "The cam can also cycle to enemies, civilians and hostages, not only the operators you control",
-                        &g_settings.allowAllHumans};
-    any.onChange = SaveSettings;
-    add(any);
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Picture"});
 
@@ -534,13 +519,6 @@ void BuildOptions()
     plans.onChange = SaveSettings;
     add(plans);
 
-    DK2ML_Option nvg = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Remove night vision overlay in the helmet view",
-                        "On night maps the helmet picture is drawn without the night-vision effect and the IR lasers. The "
-                        "scene may look darker. The main view is unaffected",
-                        &g_settings.hideNightVision};
-    nvg.onChange = SaveSettings;
-    add(nvg);
-
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Performance"});
 
     static const char* const kRefreshRates[] = {"Every frame", "60 fps", "30 fps", "15 fps"};
@@ -556,11 +534,6 @@ void BuildOptions()
 
     add({sizeof(DK2ML_Option), DK2ML_OPTION_HEADER, "Automatic switching"});
 
-    auto toggle = [&](const char* label, const char* tip, bool* value) {
-        DK2ML_Option o = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, label, tip, value};
-        o.onChange = SaveSettings;
-        add(o);
-    };
     auto autoSlider = [&](const char* label, const char* tip, int* value, int lo, int hi) {
         DK2ML_Option o = {sizeof(DK2ML_Option), DK2ML_OPTION_INT, label, tip, value, static_cast<float>(lo),
                           static_cast<float>(hi), "%d ms"};
@@ -576,15 +549,8 @@ void BuildOptions()
     selection.choiceCount = 2;
     selection.onChange = SaveSettings;
     add(selection);
-    toggle("Switch to operators who are engaging",
-           "If the cam's operator isn't engaging (aiming at an enemy they see, or shooting) but another operator is, the cam "
-           "switches to them",
-           &g_settings.engageSwitch);
     autoSlider("Switch cooldown", "After an action cam switch, the action cam waits this long before it switches again. Selection and key switching ignore it",
                &g_settings.cooldownMs, 100, 4000);
-    toggle("Count aiming at a seen enemy",
-           "Engaging starts when an operator aims at an enemy they can see, before the first shot. Off: shots only",
-           &g_settings.engageOnAim);
     autoSlider("Aim held for", "How long an operator must keep aiming at an enemy they see before it counts; sweeping past "
                "one doesn't", &g_settings.aimSettleMs, 0, 1000);
     autoSlider("Stay engaged after", "How long the cam stays on its operator after their last shot or sighting. Other operators only count while they are shooting or aiming",
@@ -607,6 +573,12 @@ void BuildOptions()
                         &g_settings.logOperators};
     log.onChange = SaveSettings;
     add(log);
+
+    DK2ML_Option any = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Allow enemy and civilian helmet cams",
+                        "The cam can also cycle to enemies, civilians and hostages, not only the operators you control",
+                        &g_settings.allowAllHumans};
+    any.onChange = SaveSettings;
+    add(any);
 }
 
 bool AddOptions()
@@ -1178,12 +1150,10 @@ void UpdateEngagement(const std::vector<void*>& ops, int now)
     ULONGLONG tick = GetTickCount64();
     if (tick - g_lastEngageTick >= 100) {
         g_lastEngageTick = tick;
-        if (g_settings.engageOnAim) {
-            std::vector<void*> humans = AllHumans();
-            for (void* op : ops) {
-                if (IsAlive(op) && AimSettled(op, humans, now)) {
-                    g_lastEngaged[Entity_id(op)] = now;
-                }
+        std::vector<void*> humans = AllHumans();
+        for (void* op : ops) {
+            if (IsAlive(op) && AimSettled(op, humans, now)) {
+                g_lastEngaged[Entity_id(op)] = now;
             }
         }
     }
@@ -2055,7 +2025,6 @@ void BuildCamera(void* human, const int* viewport, Vec3& eyeOut, Vec3& fwdOut)
     g_lastBoneEye = boneEye;
     g_lastBoneOk = haveBone;
 
-    eye.y += g_settings.offsetUp;
     eye.x += f.x * g_settings.offsetForward;
     eye.z += f.z * g_settings.offsetForward;
 
