@@ -192,6 +192,47 @@ dk2ml::Global<PFN_FramebufferTexture2D> gl_FramebufferTexture2D{"glFramebufferTe
 dk2ml::Global<PFN_CheckFramebufferStatus> gl_CheckFramebufferStatus{"glCheckFramebufferStatus"};
 dk2ml::Global<PFN_BlitFramebuffer> gl_BlitFramebuffer{"glBlitFramebuffer"};
 
+// The fisheye effect draws one small triangle with a shader of our own, like the game's own fullscreen passes.
+using PFN_CreateShader = GLuint(APIENTRY*)(GLenum);
+using PFN_ShaderSource = void(APIENTRY*)(GLuint, GLsizei, const char* const*, const GLint*);
+using PFN_CompileShader = void(APIENTRY*)(GLuint);
+using PFN_GetShaderiv = void(APIENTRY*)(GLuint, GLenum, GLint*);
+using PFN_GetInfoLog = void(APIENTRY*)(GLuint, GLsizei, GLsizei*, char*);
+using PFN_CreateProgram = GLuint(APIENTRY*)();
+using PFN_AttachShader = void(APIENTRY*)(GLuint, GLuint);
+using PFN_LinkProgram = void(APIENTRY*)(GLuint);
+using PFN_UseProgram = void(APIENTRY*)(GLuint);
+using PFN_GetUniformLocation = GLint(APIENTRY*)(GLuint, const char*);
+using PFN_Uniform1f = void(APIENTRY*)(GLint, GLfloat);
+using PFN_Uniform1i = void(APIENTRY*)(GLint, GLint);
+using PFN_ActiveTexture = void(APIENTRY*)(GLenum);
+using PFN_Delete = void(APIENTRY*)(GLuint);
+using PFN_GenVertexArrays = void(APIENTRY*)(GLsizei, GLuint*);
+using PFN_DeleteVertexArrays = void(APIENTRY*)(GLsizei, const GLuint*);
+using PFN_BindVertexArray = void(APIENTRY*)(GLuint);
+using PFN_BindSampler = void(APIENTRY*)(GLuint, GLuint);
+dk2ml::Global<PFN_CreateShader> gl_CreateShader{"glCreateShader"};
+dk2ml::Global<PFN_ShaderSource> gl_ShaderSource{"glShaderSource"};
+dk2ml::Global<PFN_CompileShader> gl_CompileShader{"glCompileShader"};
+dk2ml::Global<PFN_GetShaderiv> gl_GetShaderiv{"glGetShaderiv"};
+dk2ml::Global<PFN_GetInfoLog> gl_GetShaderInfoLog{"glGetShaderInfoLog"};
+dk2ml::Global<PFN_GetShaderiv> gl_GetProgramiv{"glGetProgramiv"};
+dk2ml::Global<PFN_GetInfoLog> gl_GetProgramInfoLog{"glGetProgramInfoLog"};
+dk2ml::Global<PFN_CreateProgram> gl_CreateProgram{"glCreateProgram"};
+dk2ml::Global<PFN_AttachShader> gl_AttachShader{"glAttachShader"};
+dk2ml::Global<PFN_LinkProgram> gl_LinkProgram{"glLinkProgram"};
+dk2ml::Global<PFN_UseProgram> gl_UseProgram{"glUseProgram"};
+dk2ml::Global<PFN_GetUniformLocation> gl_GetUniformLocation{"glGetUniformLocation"};
+dk2ml::Global<PFN_Uniform1f> gl_Uniform1f{"glUniform1f"};
+dk2ml::Global<PFN_Uniform1i> gl_Uniform1i{"glUniform1i"};
+dk2ml::Global<PFN_ActiveTexture> gl_ActiveTexture{"glActiveTexture"};
+dk2ml::Global<PFN_Delete> gl_DeleteShader{"glDeleteShader"};
+dk2ml::Global<PFN_Delete> gl_DeleteProgram{"glDeleteProgram"};
+dk2ml::Global<PFN_GenVertexArrays> gl_GenVertexArrays{"glGenVertexArrays"};
+dk2ml::Global<PFN_DeleteVertexArrays> gl_DeleteVertexArrays{"glDeleteVertexArrays"};
+dk2ml::Global<PFN_BindVertexArray> gl_BindVertexArray{"glBindVertexArray"};
+dk2ml::Global<PFN_BindSampler> gl_BindSampler{"glBindSampler"};
+
 // OpenGL's own constants (fixed by the GL spec, not by the game build).
 constexpr GLenum kFramebuffer = 0x8D40;
 constexpr GLenum kReadFramebuffer = 0x8CA8;
@@ -204,6 +245,15 @@ constexpr GLenum kTextureBinding2D = 0x8069;
 constexpr GLenum kReadBuffer = 0x0C02;
 constexpr GLenum kSamples = 0x80A9;
 constexpr GLenum kScissorTest = 0x0C11;
+constexpr GLenum kVertexShader = 0x8B31;
+constexpr GLenum kFragmentShader = 0x8B30;
+constexpr GLenum kCompileStatus = 0x8B81;
+constexpr GLenum kLinkStatus = 0x8B82;
+constexpr GLenum kCurrentProgram = 0x8B8D;
+constexpr GLenum kVertexArrayBinding = 0x85B5;
+constexpr GLenum kActiveTexture = 0x84E0;
+constexpr GLenum kTexture0 = 0x84C0;
+constexpr GLenum kSamplerBinding = 0x8919;
 
 // --- settings: packaged defaults (mod\defaults.ini, read only) -> the player's copy (<settings folder>\settings.ini) ---
 struct Settings {
@@ -219,6 +269,8 @@ struct Settings {
     int offsetY = 16;
     int sizePercent = 25;        // picture width as a percentage of the window width
     bool hideNightVision = false; // no night-vision overlay in the helmet picture
+    bool fisheye = false;        // bend the helmet picture like a wide-angle lens
+    float fisheyeStrength = 0.35f; // config file only: 0 none .. 1 strong
     int captureSource = 0;       // config file only: 0 automatic, 1 always the back buffer, 2 always the game's own texture
     int refreshRate = 2;         // how often the helmet view is re-rendered: 0 every frame, 1 60, 2 30, 3 15 fps
     bool colorName = true;       // ...on a chip in the colour of the operator's path, while Colored plans is on
@@ -276,6 +328,9 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.hideNightVision = ReadInt(file, L"hide_night_vision", s.hideNightVision) != 0;
     s.refreshRate = std::clamp(ReadInt(file, L"refresh_rate", s.refreshRate), 0, 3);
     s.captureSource = std::clamp(ReadInt(file, L"capture_source", s.captureSource), 0, 2);
+    s.fisheye = ReadInt(file, L"fisheye", s.fisheye) != 0;
+    ReadFloat(file, L"fisheye_strength", s.fisheyeStrength);
+    s.fisheyeStrength = std::clamp(s.fisheyeStrength, 0.0f, 1.0f);
     s.colorName = ReadInt(file, L"color_name", s.colorName) != 0;
     s.fowOff = ReadInt(file, L"fow_off", s.fowOff) != 0;
     s.hidePlans = ReadInt(file, L"hide_plans", s.hidePlans) != 0;
@@ -326,6 +381,8 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"hide_night_vision", g_settings.hideNightVision);
     write(L"refresh_rate", g_settings.refreshRate);
     write(L"capture_source", g_settings.captureSource);
+    write(L"fisheye", g_settings.fisheye);
+    writeFloat(L"fisheye_strength", g_settings.fisheyeStrength);
     write(L"color_name", g_settings.colorName);
     write(L"fow_off", g_settings.fowOff);
     write(L"hide_plans", g_settings.hidePlans);
@@ -438,6 +495,13 @@ void BuildOptions()
            &g_settings.offsetY, 0, 400, "%d px");
     pixels("Picture size", "Width of the helmet picture as a percentage of the window width", &g_settings.sizePercent,
            10, 60, "%d %%");
+
+    DK2ML_Option fisheye = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Fisheye lens effect",
+                            "Bends the helmet picture like a wide-angle lens: the centre is slightly magnified and the edges "
+                            "curve. Works best with a wider field of view",
+                            &g_settings.fisheye};
+    fisheye.onChange = SaveSettings;
+    add(fisheye);
 
     DK2ML_Option colorName = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Colour the name like the operator's path",
                               "While the game's Colored plans option is on, the name's background takes the colour of "
@@ -1684,8 +1748,8 @@ void FillSolid(int code)
     g_texFill = code;
 }
 
-// Our texture into the top-right corner of the back buffer.
-void BlitToCorner(int viewW, int viewH)
+// Our texture into the picture's corner of the back buffer, as is.
+void BlitToCornerPlain(int viewW, int viewH)
 {
     PipRect rect = ComputePipRect(viewW, viewH);
     int x0 = rect.x;
@@ -1700,6 +1764,202 @@ void BlitToCorner(int viewW, int viewH)
     (*gl_BindFramebuffer)(kDrawFramebuffer, 0);
     (*gl_BlitFramebuffer)(0, 0, g_texW, g_texH, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     RestoreGl(saved);
+}
+
+// --- the fisheye lens effect ---
+// One triangle drawn into the corner rectangle with a shader that samples our picture through a barrel distortion: a pixel at
+// d (-1..1 from the centre, r2 = dot(d, d)) takes the colour from d * (1 + k * r2) / (1 + 2k). The division makes the picture's
+// corners map exactly onto the source's corners, so nothing is stretched past the edges and no corner is empty; the centre is
+// slightly magnified and the edges curve. The vertex shader is the game's own fullscreen-triangle trick (no buffers).
+GLuint g_fishProgram = 0;
+GLuint g_fishVao = 0;
+GLint g_fishTexLoc = -1;
+GLint g_fishStrengthLoc = -1;
+bool g_fishBroken = false; // compile or link failed: the plain blit from now on
+
+const char* const kFishVertexShader = R"(#version 140
+out vec2 pxTexCoord1;
+void main(void)
+{
+    float x = -1.0 + float((gl_VertexID & 1) << 2);
+    float y = -1.0 + float((gl_VertexID & 2) << 1);
+    pxTexCoord1 = vec2((x + 1.0) * 0.5, (y + 1.0) * 0.5);
+    gl_Position = vec4(x, y, 0.0, 1.0);
+}
+)";
+
+const char* const kFishFragmentShader = R"(#version 140
+uniform sampler2D inTex0;
+uniform float inStrength;
+in vec2 pxTexCoord1;
+out vec4 outFragColor0;
+void main(void)
+{
+    vec2 d = pxTexCoord1 * 2.0 - 1.0;
+    float r2 = dot(d, d);
+    vec2 s = d * (1.0 + inStrength * r2) / (1.0 + 2.0 * inStrength);
+    outFragColor0 = vec4(texture(inTex0, clamp(s * 0.5 + 0.5, 0.0, 1.0)).rgb, 1.0);
+}
+)";
+
+bool FisheyeGlReady()
+{
+    return *gl_CreateShader && *gl_ShaderSource && *gl_CompileShader && *gl_GetShaderiv && *gl_GetShaderInfoLog &&
+           *gl_GetProgramiv && *gl_GetProgramInfoLog && *gl_CreateProgram && *gl_AttachShader && *gl_LinkProgram &&
+           *gl_UseProgram && *gl_GetUniformLocation && *gl_Uniform1f && *gl_Uniform1i && *gl_ActiveTexture &&
+           *gl_DeleteShader && *gl_DeleteProgram && *gl_GenVertexArrays && *gl_BindVertexArray;
+}
+
+GLuint CompileFisheyeShader(GLenum type, const char* source)
+{
+    GLuint shader = (*gl_CreateShader)(type);
+    (*gl_ShaderSource)(shader, 1, &source, nullptr);
+    (*gl_CompileShader)(shader);
+    GLint ok = 0;
+    (*gl_GetShaderiv)(shader, kCompileStatus, &ok);
+    if (!ok) {
+        char log[512] = {};
+        (*gl_GetShaderInfoLog)(shader, sizeof(log) - 1, nullptr, log);
+        g_api->Log("helmet cam: the fisheye %s shader did not compile: %s", type == kVertexShader ? "vertex" : "fragment", log);
+        (*gl_DeleteShader)(shader);
+        return 0;
+    }
+    return shader;
+}
+
+bool EnsureFisheyeProgram()
+{
+    if (g_fishProgram) {
+        return true;
+    }
+    if (g_fishBroken) {
+        return false;
+    }
+    if (!FisheyeGlReady()) {
+        g_fishBroken = true;
+        g_api->Log("helmet cam: fisheye is not available (this game build lacks a GL shader function)");
+        return false;
+    }
+    GLuint vs = CompileFisheyeShader(kVertexShader, kFishVertexShader);
+    GLuint fs = vs ? CompileFisheyeShader(kFragmentShader, kFishFragmentShader) : 0;
+    if (!vs || !fs) {
+        if (vs) {
+            (*gl_DeleteShader)(vs);
+        }
+        g_fishBroken = true;
+        return false;
+    }
+    GLuint program = (*gl_CreateProgram)();
+    (*gl_AttachShader)(program, vs);
+    (*gl_AttachShader)(program, fs);
+    (*gl_LinkProgram)(program);
+    (*gl_DeleteShader)(vs);
+    (*gl_DeleteShader)(fs);
+    GLint ok = 0;
+    (*gl_GetProgramiv)(program, kLinkStatus, &ok);
+    if (!ok) {
+        char log[512] = {};
+        (*gl_GetProgramInfoLog)(program, sizeof(log) - 1, nullptr, log);
+        g_api->Log("helmet cam: the fisheye shader did not link: %s", log);
+        (*gl_DeleteProgram)(program);
+        g_fishBroken = true;
+        return false;
+    }
+    g_fishTexLoc = (*gl_GetUniformLocation)(program, "inTex0");
+    g_fishStrengthLoc = (*gl_GetUniformLocation)(program, "inStrength");
+    (*gl_GenVertexArrays)(1, &g_fishVao);
+    g_fishProgram = program;
+    g_api->Log("helmet cam: fisheye shader ready");
+    return true;
+}
+
+void FreeFisheye()
+{
+    if (g_fishProgram) {
+        (*gl_DeleteProgram)(g_fishProgram);
+        g_fishProgram = 0;
+    }
+    if (g_fishVao && *gl_DeleteVertexArrays) {
+        (*gl_DeleteVertexArrays)(1, &g_fishVao);
+    }
+    g_fishVao = 0;
+}
+
+// Our texture into the corner rectangle, bent. Everything the draw touches is put back afterwards: the HUD and ImGui are drawn
+// by the game right after this.
+void DrawFisheye(int viewW, int viewH)
+{
+    PipRect rect = ComputePipRect(viewW, viewH);
+    int y1 = viewH - rect.yTop; // GL's origin is the bottom left
+
+    GLint program = 0, vao = 0, activeTexture = 0, texture0 = 0, sampler0 = 0, drawFb = 0;
+    GLint viewport[4] = {};
+    GLboolean colorMask[4] = {};
+    GLboolean scissor = glIsEnabled(kScissorTest), blend = glIsEnabled(GL_BLEND), depth = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean stencil = glIsEnabled(GL_STENCIL_TEST), cull = glIsEnabled(GL_CULL_FACE);
+    glGetIntegerv(kCurrentProgram, &program);
+    glGetIntegerv(kVertexArrayBinding, &vao);
+    glGetIntegerv(kActiveTexture, &activeTexture);
+    glGetIntegerv(kDrawFramebufferBinding, &drawFb);
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+    (*gl_ActiveTexture)(kTexture0); // unit 0 is the one we use: remember what it held
+    glGetIntegerv(kTextureBinding2D, &texture0);
+    if (*gl_BindSampler) {
+        glGetIntegerv(kSamplerBinding, &sampler0);
+        (*gl_BindSampler)(0, 0); // a sampler object would override our texture's own filtering
+    }
+
+    (*gl_BindFramebuffer)(kDrawFramebuffer, 0);
+    glDisable(kScissorTest);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(rect.x, y1 - rect.h, rect.w, rect.h);
+    glBindTexture(GL_TEXTURE_2D, g_tex);
+    (*gl_UseProgram)(g_fishProgram);
+    (*gl_Uniform1i)(g_fishTexLoc, 0);
+    (*gl_Uniform1f)(g_fishStrengthLoc, g_settings.fisheyeStrength);
+    (*gl_BindVertexArray)(g_fishVao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    (*gl_BindVertexArray)(static_cast<GLuint>(vao));
+    (*gl_UseProgram)(static_cast<GLuint>(program));
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture0));
+    if (*gl_BindSampler) {
+        (*gl_BindSampler)(0, static_cast<GLuint>(sampler0));
+    }
+    (*gl_ActiveTexture)(static_cast<GLenum>(activeTexture));
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+    (*gl_BindFramebuffer)(kDrawFramebuffer, static_cast<GLuint>(drawFb));
+    if (scissor) {
+        glEnable(kScissorTest);
+    }
+    if (blend) {
+        glEnable(GL_BLEND);
+    }
+    if (depth) {
+        glEnable(GL_DEPTH_TEST);
+    }
+    if (stencil) {
+        glEnable(GL_STENCIL_TEST);
+    }
+    if (cull) {
+        glEnable(GL_CULL_FACE);
+    }
+}
+
+// Our texture into the corner of the back buffer: bent when the fisheye effect is on, a plain copy otherwise.
+void BlitToCorner(int viewW, int viewH)
+{
+    if (g_settings.fisheye && EnsureFisheyeProgram()) {
+        DrawFisheye(viewW, viewH);
+        return;
+    }
+    BlitToCornerPlain(viewW, viewH);
 }
 
 // --- the camera at the operator's head ---
@@ -1953,7 +2213,7 @@ ULONGLONG g_closedSince = 0;
 
 void FreeBuffersWhenIdle()
 {
-    if (!g_fbo && !g_tex && !g_fullFbo && !g_fullTex && !g_srcFbo) {
+    if (!g_fbo && !g_tex && !g_fullFbo && !g_fullTex && !g_srcFbo && !g_fishProgram) {
         g_closedSince = 0;
         return;
     }
@@ -1972,6 +2232,7 @@ void FreeBuffersWhenIdle()
         g_srcFbo = 0;
     }
     g_gameTexSizes.clear();
+    FreeFisheye();
     std::vector<unsigned char>().swap(g_fillPixels); // gives the memory back, clear() would not
     g_texFill = -1;
     g_forcePass = true; // the next open draws a fresh picture
