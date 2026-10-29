@@ -269,6 +269,7 @@ struct Settings {
     int offsetY = 16;
     int sizePercent = 25;        // picture width as a percentage of the window width
     bool hideNightVision = false; // no night-vision overlay in the helmet picture
+    bool bodycamOverlay = true;  // a flashing red recording light by the name, and a date, time and camera ID at the top right
     bool fisheye = false;        // bend the helmet picture like a wide-angle lens
     float fisheyeStrength = 0.35f; // config file only: 0 none .. 1 strong
     int captureSource = 0;       // config file only: 0 automatic, 1 always the back buffer, 2 always the game's own texture
@@ -329,6 +330,7 @@ void ReadIni(const std::wstring& file, Settings& s)
     s.refreshRate = std::clamp(ReadInt(file, L"refresh_rate", s.refreshRate), 0, 3);
     s.captureSource = std::clamp(ReadInt(file, L"capture_source", s.captureSource), 0, 2);
     s.fisheye = ReadInt(file, L"fisheye", s.fisheye) != 0;
+    s.bodycamOverlay = ReadInt(file, L"bodycam_overlay", s.bodycamOverlay) != 0;
     ReadFloat(file, L"fisheye_strength", s.fisheyeStrength);
     s.fisheyeStrength = std::clamp(s.fisheyeStrength, 0.0f, 1.0f);
     s.colorName = ReadInt(file, L"color_name", s.colorName) != 0;
@@ -382,6 +384,7 @@ void SaveSettings(const DK2ML_Option*, void*)
     write(L"refresh_rate", g_settings.refreshRate);
     write(L"capture_source", g_settings.captureSource);
     write(L"fisheye", g_settings.fisheye);
+    write(L"bodycam_overlay", g_settings.bodycamOverlay);
     writeFloat(L"fisheye_strength", g_settings.fisheyeStrength);
     write(L"color_name", g_settings.colorName);
     write(L"fow_off", g_settings.fowOff);
@@ -502,6 +505,13 @@ void BuildOptions()
                             &g_settings.fisheye};
     fisheye.onChange = SaveSettings;
     add(fisheye);
+
+    DK2ML_Option bodycam = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Bodycam overlay",
+                            "Like a body camera: a flashing red recording light next to the name, and the date, time and a "
+                            "camera ID at the top right of the picture",
+                            &g_settings.bodycamOverlay};
+    bodycam.onChange = SaveSettings;
+    add(bodycam);
 
     DK2ML_Option colorName = {sizeof(DK2ML_Option), DK2ML_OPTION_BOOL, "Colour the name like the operator's path",
                               "While the game's Colored plans option is on, the name's background takes the colour of "
@@ -646,6 +656,7 @@ dk2ml::Enum ImGuiWindowFlags_NoCollapse{"ImGuiWindowFlags_", "ImGuiWindowFlags_N
 // current window is moved after Begin).
 dk2ml::Enum ImGuiWindowFlags_NoDecoration{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoDecoration"};
 dk2ml::Enum ImGuiWindowFlags_NoSavedSettings{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoSavedSettings"};
+dk2ml::Enum ImGuiWindowFlags_NoBackground{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoBackground"};
 dk2ml::Enum ImGuiWindowFlags_NoMouseInputs{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoMouseInputs"};
 dk2ml::Enum ImGuiWindowFlags_NoFocusOnAppearing{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoFocusOnAppearing"};
 dk2ml::Enum ImGuiWindowFlags_NoNav{"ImGuiWindowFlags_", "ImGuiWindowFlags_NoNav"};
@@ -654,6 +665,14 @@ dk2ml::Field<void*> ImGuiContext_CurrentWindow{"ImGuiContext", "CurrentWindow"};
 // SetWindowFontScale is inlined away: it only stores the window's scale and refreshes the two cached font sizes, so
 // the name label does the same by hand (ImGui::End re-derives them for the window underneath).
 dk2ml::Field<float> ImGuiWindow_FontWindowScale{"ImGuiWindow", "FontWindowScale"};
+// The bodycam overlay: a red dot drawn into the name window's own draw list, and a second small window for the timestamp.
+dk2ml::Field<uint8_t> ImGuiWindow_Pos{"ImGuiWindow", "Pos"};
+dk2ml::Field<uint8_t> ImGuiWindow_Size{"ImGuiWindow", "Size"};
+dk2ml::Field<void*> ImGuiWindow_DrawList{"ImGuiWindow", "DrawList"};
+dk2ml::Field<uint8_t> ImGuiStyle_WindowPadding{"ImGuiStyle", "WindowPadding"};
+dk2ml::Fn<void(const ImVec2* size)> ImGui_Dummy{"ImGui::Dummy"};
+dk2ml::Fn<void(void* drawList, const ImVec2* center, float radius, uint32_t color, int segments)> ImDrawList_AddCircleFilled{
+    "ImDrawList::AddCircleFilled"};
 dk2ml::Field<float> ImGuiContext_FontSize{"ImGuiContext", "FontSize"};
 dk2ml::Field<float> ImGuiContext_FontBaseSize{"ImGuiContext", "FontBaseSize"};
 dk2ml::Field<uint8_t> ImGuiContext_DrawListSharedData{"ImGuiContext", "DrawListSharedData"};
@@ -2482,6 +2501,64 @@ void* TargetHuman()
     return nullptr;
 }
 
+// The recording light: a red dot in the picture's top-left corner, in a window of its own with no background, so the name chip
+// holds only the name. The dot is as tall as a line of the name's text and the window has the chip's padding, so it lines up with
+// the name. It flashes about once a second, and stays off when the operator is dead (the recording has stopped). The name chip
+// starts after it (see DrawNameLabel).
+constexpr float kNameFontScale = 2.0f; // the name is drawn at twice the default text size
+
+struct RecLight {
+    float diameter, height, width; // dot size, text line height, and the window's width (dot plus both paddings)
+    float padX, padY;              // the style's window padding
+};
+
+RecLight RecLightMetrics(void* context)
+{
+    float base = context ? dk2ml::At<float>(context, ImGuiContext_FontBaseSize.Offset()) : 13.0f;
+    float padX = context ? dk2ml::At<float>(context, ImGuiContext_Style.Offset() + ImGuiStyle_WindowPadding.Offset()) : 8.0f;
+    float padY = context ? dk2ml::At<float>(context, ImGuiContext_Style.Offset() + ImGuiStyle_WindowPadding.Offset() + 4) : 8.0f;
+    float height = base * kNameFontScale;
+    float diameter = height * 0.55f;
+    return {diameter, height, diameter + 2.0f * padX, padX, padY};
+}
+
+void DrawRecordLight()
+{
+    if (!g_settings.bodycamOverlay || !g_settings.enabled || !g_open || !g_fbo || g_frame.viewW <= 0 || !InMission() ||
+        dk2ml::GameMenuOpen(g_api)) {
+        return;
+    }
+    void* human = TargetHuman();
+    if (!human) {
+        return;
+    }
+    int flags = static_cast<int>(ImGuiWindowFlags_NoDecoration.Get() | ImGuiWindowFlags_AlwaysAutoResize.Get() |
+                                 ImGuiWindowFlags_NoSavedSettings.Get() | ImGuiWindowFlags_NoMouseInputs.Get() |
+                                 ImGuiWindowFlags_NoFocusOnAppearing.Get() | ImGuiWindowFlags_NoNav.Get() |
+                                 ImGuiWindowFlags_NoBackground.Get());
+    void* context = GImGui ? *GImGui : nullptr;
+    bool begun = ImGui_Begin("##helmetcam_rec", nullptr, flags);
+    if (begun) {
+        void* window = context ? dk2ml::At<void*>(context, ImGuiContext_CurrentWindow.Offset()) : nullptr;
+        if (window) {
+            PipRect rect = ComputePipRect(g_frame.viewW, g_frame.viewH);
+            ImVec2 pos = {static_cast<float>(rect.x + 8), static_cast<float>(rect.yTop + 8)};
+            ImGui_SetWindowPos(window, &pos, static_cast<int>(ImGuiCond_Always.Get()));
+
+            RecLight m = RecLightMetrics(context);
+            ImVec2 space = {m.diameter, m.height}; // gives the window its size, so the dot has room
+            ImGui_Dummy(&space);
+            bool lit = (GetTickCount64() / 600) % 2 == 0 && IsAlive(human);
+            void* drawList = dk2ml::At<void*>(window, ImGuiWindow_DrawList.Offset());
+            if (lit && drawList) {
+                ImVec2 centre = {pos.x + m.padX + m.diameter * 0.5f, pos.y + m.padY + m.height * 0.5f};
+                ImDrawList_AddCircleFilled(drawList, &centre, m.diameter * 0.5f, 0xFF2828FF, 0); // red, as 0xAABBGGRR
+            }
+        }
+    }
+    ImGui_End();
+}
+
 // The name at the top left of the helmet picture: a small borderless, click-through ImGui window, placed in window pixels
 // (the same space as the picture). Its default background keeps the text readable on any scene.
 void DrawNameLabel()
@@ -2543,11 +2620,13 @@ void DrawNameLabel()
         void* window = context ? dk2ml::At<void*>(context, ImGuiContext_CurrentWindow.Offset()) : nullptr;
         if (window) {
             PipRect rect = ComputePipRect(g_frame.viewW, g_frame.viewH);
-            ImVec2 pos = {static_cast<float>(rect.x + 8), static_cast<float>(rect.yTop + 8)};
+            // With the bodycam overlay the recording light sits in the corner and the chip starts after it.
+            float shift = g_settings.bodycamOverlay ? RecLightMetrics(context).width + 4.0f : 0.0f;
+            ImVec2 pos = {static_cast<float>(rect.x + 8) + shift, static_cast<float>(rect.yTop + 8)};
             ImGui_SetWindowPos(window, &pos, static_cast<int>(ImGuiCond_Always.Get()));
 
             // Twice the default text size for this window only.
-            constexpr float kNameScale = 2.0f;
+            const float kNameScale = kNameFontScale;
             dk2ml::At<float>(window, ImGuiWindow_FontWindowScale.Offset()) = kNameScale;
             float size = dk2ml::At<float>(context, ImGuiContext_FontBaseSize.Offset()) * kNameScale;
             dk2ml::At<float>(context, ImGuiContext_FontSize.Offset()) = size;
@@ -2561,6 +2640,67 @@ void DrawNameLabel()
         }
     }
     ImGui_End(); // always, whatever Begin returned
+}
+
+// The date, time and a camera ID at the top right of the picture, like the overlay of a body camera. The date and time are
+// the PC's real ones in its regional format (24 hour clock); the ID is "HC-" and the operator's entity id. Plain ASCII only.
+std::string BodycamStamp(uint32_t operatorId)
+{
+    SYSTEMTIME now = {};
+    GetLocalTime(&now);
+    wchar_t dateText[64] = {}, timeText[64] = {};
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &now, nullptr, dateText, 64, nullptr);
+    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_FORCE24HOURFORMAT, &now, L"HH':'mm':'ss", timeText, 64);
+    std::string text;
+    for (const wchar_t* part : {static_cast<const wchar_t*>(dateText), L" ", static_cast<const wchar_t*>(timeText)}) {
+        for (const wchar_t* c = part; *c; ++c) {
+            if (*c >= 0x20 && *c < 0x7F) {
+                text.push_back(static_cast<char>(*c)); // drops direction marks and non-ASCII digits some locales add
+            }
+        }
+    }
+    char id[32];
+    snprintf(id, sizeof(id), " HC-%u", operatorId);
+    return text + id;
+}
+
+void DrawTimestamp()
+{
+    if (!g_settings.bodycamOverlay || !g_settings.enabled || !g_open || !g_fbo || g_frame.viewW <= 0 || !InMission() ||
+        dk2ml::GameMenuOpen(g_api)) {
+        return;
+    }
+    void* human = TargetHuman();
+    PipRect rect = ComputePipRect(g_frame.viewW, g_frame.viewH);
+    if (!human || rect.w < 480) {
+        return; // no room next to the name on a very small picture
+    }
+
+    int flags = static_cast<int>(ImGuiWindowFlags_NoDecoration.Get() | ImGuiWindowFlags_AlwaysAutoResize.Get() |
+                                 ImGuiWindowFlags_NoSavedSettings.Get() | ImGuiWindowFlags_NoMouseInputs.Get() |
+                                 ImGuiWindowFlags_NoFocusOnAppearing.Get() | ImGuiWindowFlags_NoNav.Get());
+    void* context = GImGui ? *GImGui : nullptr;
+    bool begun = ImGui_Begin("##helmetcam_time", nullptr, flags);
+    if (begun) {
+        void* window = context ? dk2ml::At<void*>(context, ImGuiContext_CurrentWindow.Offset()) : nullptr;
+        if (window) {
+            // Right-aligned by the window's size from the previous frame (there is no pivot call to use).
+            float width = dk2ml::At<float>(window, ImGuiWindow_Size.Offset());
+            ImVec2 pos = {static_cast<float>(rect.x + rect.w - 8) - width, static_cast<float>(rect.yTop + 8)};
+            ImGui_SetWindowPos(window, &pos, static_cast<int>(ImGuiCond_Always.Get()));
+
+            // The text grows with the picture: about 1.4x at the default size.
+            float scale = std::clamp(static_cast<float>(rect.w) * 1.4f / 960.0f, 0.9f, 1.6f);
+            dk2ml::At<float>(window, ImGuiWindow_FontWindowScale.Offset()) = scale;
+            float size = dk2ml::At<float>(context, ImGuiContext_FontBaseSize.Offset()) * scale;
+            dk2ml::At<float>(context, ImGuiContext_FontSize.Offset()) = size;
+            dk2ml::At<float>(context, ImGuiContext_DrawListSharedData.Offset() + ImDrawListSharedData_FontSize.Offset()) =
+                size;
+        }
+        std::string text = BodycamStamp(Entity_id(human));
+        ImGui_TextEx(text.c_str(), nullptr, 0);
+    }
+    ImGui_End();
 }
 
 // --- the HUD widget: one Helmet Cam icon in the game's bottom HUD bar; clicking it fans out an arc of buttons ---
@@ -2751,7 +2891,9 @@ void OnFrame(const DK2ML_Event*, void*)
         UpdateAutoTarget();
     }
     DrawSettingsWindow();
+    DrawRecordLight();
     DrawNameLabel();
+    DrawTimestamp();
     UpdateArcDismiss();
     UpdateHud();
 }
