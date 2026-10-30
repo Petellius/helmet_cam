@@ -109,6 +109,13 @@ dk2ml::Enum COL_VISION_BLOCK{"eCollisionFlags", "COL_VISION_BLOCK"};
 dk2ml::Fn<bool(const Vec3* eye, const Vec3* dir, float coneDeg, const void* target, uint32_t blockFlags, bool flag)>
     GameCommon_HasLineOfSight{"?HasLineOfSight@GameCommon@@SA_NAEBVVector3@@0MPEBVEntity_Common@@I_N@Z"};
 // void Human_Client::Net_ReceiveEvent(eNetworkMask, eEntityEvent, unsigned size, const BitPacker&): argument 2 is the event
+// The troop list on the left of the HUD. Its click handler is GameGUI::Profiles_Clicked(item, button): button 1 is a left click
+// (it moves the camera to the operator), and the item's user data id is the list slot, which GameGUI::m_profileHumans maps to an
+// entity id. In a replay the game's own ChangeSelection does nothing useful, so the click is read here instead.
+dk2ml::Fn<void(void* gui, void* item, int button)> GameGUI_Profiles_Clicked{"GameGUI::Profiles_Clicked"};
+dk2ml::Field<uint8_t> GameGUI_profileHumans{"GameGUI", "m_profileHumans"}; // List<unsigned int>: entity ids, one per slot
+dk2ml::Field<uint8_t> Item_userData{"GUI::Item", "m_userData"};
+dk2ml::Field<uint32_t> UserData_id{"GUI::sUserData", "id"};
 dk2ml::Fn<void(void* human, int mask, int event, unsigned size, const void* packer)> Human_Net_ReceiveEvent{
     "?Net_ReceiveEvent@Human_Client@@UEAAXW4eNetworkMask@@W4eEntityEvent@Entity_Common@@IAEBVBitPacker@@@Z"};
 
@@ -542,8 +549,9 @@ void BuildOptions()
     };
     static const char* const kSelectionModes[] = {"On key press", "Instantly"};
     DK2ML_Option selection = {sizeof(DK2ML_Option), DK2ML_OPTION_CHOICE, "Selection switching",
-                              "On key press: tapping the key switches to the operator you selected, then keeps cycling. "
-                              "Instantly: the cam switches the moment you select someone (not in replays)"};
+                              "On key press: tapping the key switches to the operator you selected (in a replay, the one you clicked in "
+                              "the troop list), then keeps cycling. Instantly: the cam switches the moment you select or click "
+                              "someone"};
     selection.value = &g_settings.selectionMode;
     selection.choices = kSelectionModes;
     selection.choiceCount = 2;
@@ -928,6 +936,7 @@ void LogPassStats(const char* why)
 }
 bool g_cycleRequested = false;
 bool g_selectionPending = false; // the player selected someone the cam hasn't gone to: the next tap goes there
+uint32_t g_replayPickedId = 0;   // in a replay: the operator last clicked in the troop list (replays have no selection)
 
 uint32_t SelectedOperatorId();
 
@@ -960,6 +969,7 @@ void ResetCam()
     g_targetId = 0;
     g_cycleRequested = false;
     g_selectionPending = false;
+    g_replayPickedId = 0;
     g_lastSwitchMs = kNever;
     g_lastSelectedId = 0;
     g_lastEngaged.clear();
@@ -1150,6 +1160,15 @@ void UpdateEngagement(const std::vector<void*>& ops, int now)
 
 uint32_t SelectedOperatorId()
 {
+    if (dk2ml::IsReplaying(g_api)) {
+        // A replay has no selection: the operator clicked in the troop list stands in for it (while they are alive).
+        for (void* h : AllHumans()) {
+            if (g_replayPickedId != 0 && Entity_id(h) == g_replayPickedId && IsOperator(h) && IsAlive(h)) {
+                return g_replayPickedId;
+            }
+        }
+        return 0;
+    }
     void* input = g_pGameInput ? *g_pGameInput : nullptr;
     void* human = input ? GameInput_GetSelectedHuman(input) : nullptr;
     return human && IsOperator(human) && IsAlive(human) ? Entity_id(human) : 0;
@@ -1165,6 +1184,45 @@ void SwitchTo(void* op, const char* reason, int now)
     g_api->Log("auto switch (%s): operator %u '%s'", reason, g_targetId, name ? name : "");
 }
 
+// A click on an operator in the troop list while a replay plays: it counts as a selection. The game's own handler still runs
+// (it moves the camera); this only watches. Instant mode switches the cam now, "on key press" lets the next tap go there.
+int ProfilesClickedPre(DK2ML_Regs* regs, void*)
+{
+    void* gui = dk2ml::Arg<void*>(regs, 0);
+    void* item = dk2ml::Arg<void*>(regs, 1);
+    int button = dk2ml::Arg<int>(regs, 2);
+    if (button != 1 || !gui || !item || !g_settings.enabled || !InMission() || !dk2ml::IsReplaying(g_api)) {
+        return DK2ML_CALL_ORIGINAL;
+    }
+    uint32_t slot = dk2ml::At<uint32_t>(item, Item_userData.Offset() + UserData_id.Offset());
+    void* list = static_cast<char*>(gui) + GameGUI_profileHumans.Offset();
+    int count = dk2ml::At<int>(list, ListId_count.Offset());
+    const uint32_t* ids = dk2ml::At<const uint32_t*>(list, ListId_data.Offset());
+    if (!ids || slot >= static_cast<uint32_t>(count)) {
+        return DK2ML_CALL_ORIGINAL;
+    }
+    for (void* human : AllHumans()) {
+        if (Entity_id(human) != ids[slot] || !IsOperator(human) || !IsAlive(human)) {
+            continue;
+        }
+        g_replayPickedId = Entity_id(human);
+        static int s_logged = 0;
+        if (s_logged++ < 8) {
+            const char* name = Entity_name(human);
+            g_api->Log("replay pick: troop list slot %u -> operator %u '%s' (%s)", slot, g_replayPickedId, name ? name : "",
+                       g_settings.selectionMode == 1 ? "switching now" : "the next tap goes there");
+        }
+        if (g_settings.selectionMode == 1) {
+            g_targetId = g_replayPickedId;
+            g_selectionPending = false;
+        } else {
+            g_selectionPending = true;
+        }
+        break;
+    }
+    return DK2ML_CALL_ORIGINAL;
+}
+
 // Runs every frame in a mission. Selection changes switch at once (instant mode); engagement (action cam) switches wait
 // for the cooldown, which only they start.
 void UpdateAutoTarget()
@@ -1178,7 +1236,7 @@ void UpdateAutoTarget()
     }
 
     // The selection is watched in both modes: instant mode switches on a change, on-key mode remembers it for the next tap.
-    uint32_t selected = dk2ml::IsReplaying(g_api) ? 0 : SelectedOperatorId();
+    uint32_t selected = SelectedOperatorId();
     bool selectionChanged = selected != g_lastSelectedId;
     g_lastSelectedId = selected;
     if (selectionChanged && selected != 0) {
@@ -2890,6 +2948,9 @@ DK2ML_EXPORT int DK2ML_PluginInit(const DK2ML_API* api, const DK2ML_PluginInfo* 
     }
     if (!dk2ml::Hook(api, GetShadowMapCameraParams, ShadowParamsPre)) {
         return 6;
+    }
+    if (!dk2ml::Hook(api, GameGUI_Profiles_Clicked, ProfilesClickedPre)) { // only watches, and only during replays
+        return 8;
     }
     if (!dk2ml::Hook(api, Human_Net_ReceiveEvent, ReceiveEventPre)) { // a no-op unless engagement switching is on
         return 7;
